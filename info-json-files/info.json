@@ -1,0 +1,11 @@
+﻿{
+	"GUID" : "BBE63CFD-A35A-4C5F-8488-020146422792",
+	"Clients" :
+		[
+			"Pro"
+		],
+	"Attribution" : "Claris",
+	"URL" : "https://claris.com",
+	"Icon_Color" : "#E6AB36",
+	"Version" : "0.1.7"
+}
