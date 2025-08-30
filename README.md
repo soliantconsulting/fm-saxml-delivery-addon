@@ -4,7 +4,7 @@ This add-on is a part of the SaXML delivery toolchain. It helps to automate the 
 
 ## Installation
 
-Per file:
+Per FileMaker database file:
 
 - Install add-on in the file
   - Note that you don't need to apply the add-on to any of the layouts in your file
