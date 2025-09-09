@@ -17,6 +17,15 @@ Per FileMaker database file:
       - The layout table does not need to contain any records.
     - ```saxmlDelivery``` family of scripts
 - Create an account that can be used to call the ```saxmlDelivery_createXml``` script with the Data API ("fmrest" extended privilege)
+  - Custom record privileges
+    - SaXMLDelivery table: View+Edit
+    - All other tables: No access
+  - Custom script privileges
+    - saxmlDelivery_createXml script: Executable only
+    - All other scripts: No access
+  - Custom layout privileges
+    - SaXMLDeliveryExecutionContext: View only (layout), Modifiable (records)
+    - All other layouts: No access
 
 Per server:
 
