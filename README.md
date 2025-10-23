@@ -1,5 +1,7 @@
 # fm-saxml-delivery-addon
 
+Version 0.1.9
+
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
 ## Installation
@@ -7,7 +9,6 @@ This add-on is a part of the SaXML delivery toolchain. It helps to automate the 
 Per FileMaker database file:
 
 - Install add-on in the file
-  - Note that you don't need to apply the add-on to any of the layouts in your file
   - Installing the add-on will create:
     - ```SaXMLDelivery``` __table__ with ```xmlFile``` and other fields
     - ```SaXMLDeliveryExecutionContext``` __layout__ with ```xmlFile``` and other fields
@@ -16,16 +17,23 @@ Per FileMaker database file:
       - The layout must contain an xmlFile field.
       - The layout table does not need to contain any records.
     - ```saxmlDelivery``` family of scripts
-- Create an account that can be used to call the ```saxmlDelivery_createXml``` script with the Data API ("fmrest" extended privilege)
+- Create a privilege set that can be used to call the ```saxmlDelivery_createXml``` script with the Data API
+  - Suggested name: 'SaXML Delivery'
   - Custom record privileges
-    - SaXMLDelivery table: View+Edit
+    - ```SaXMLDelivery``` table: View + Edit + 'modifiable' for ```xmlFile``` field ('no access' for all other fields)
     - All other tables: No access
-  - Custom script privileges
-    - saxmlDelivery_createXml script: Executable only
-    - All other scripts: No access
   - Custom layout privileges
-    - SaXMLDeliveryExecutionContext: View only (layout), Modifiable (records)
+    - ```SaXMLDeliveryExecutionContext``` layout: View only (layout), Modifiable (records)
     - All other layouts: No access
+  - Value lists
+    - All no access
+  - Custom script privileges
+    - ```saxmlDelivery_createXml``` script: Executable only
+    - All other scripts: No access
+  - Extended privileges
+    - fmrest
+- Create an account that uses that privilege set
+  - Suggested name: 'saxml'
 
 Per server:
 
