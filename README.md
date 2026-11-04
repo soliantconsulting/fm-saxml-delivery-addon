@@ -1,6 +1,6 @@
 # fm-saxml-delivery-addon
 
-Version 0.1.13
+Version 0.2.0
 
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
@@ -27,7 +27,7 @@ Per FileMaker database file:
 - Create a privilege set that can be used to call the ```saxmlDelivery_createXml``` script with the Data API
   - Suggested name: 'SaXML Delivery'
   - Custom record privileges
-    - ```SaXMLDelivery``` table: View + Edit + 'modifiable' for ```xmlFile``` field ('no access' for all other fields)
+    - ```SaXMLDelivery``` table: View + Edit + 'modifiable' for ```xmlFile``` field; 'read only' for ```jobStatus``` and ```jobMessage``` ('no access' for all other fields)
     - All other tables: No access
   - Custom layout privileges
     - ```SaXMLDeliveryExecutionContext``` layout: View only (layout), Modifiable (records)
@@ -47,6 +47,15 @@ Per server:
 - Install a valid SSL certificate (required by the Data API)
 - Enable the Data API
 
+## How it runs
+
+The ```saxmlDelivery_createXml``` script is asynchronous when the file is hosted, because the Data API times out a request after 5 minutes:
+
+- The script creates a job record and starts the export in a Perform Script on Server session that it does not wait for. It returns right away with ```{ errorCode, message, data { recordId, xmlFieldName, addonVersion, jobStatus } }``` where ```jobStatus``` is ```running```.
+- The caller polls the record on the ```SaXMLDeliveryExecutionContext``` layout until ```jobStatus``` is ```done``` or ```error```. On ```error```, ```jobMessage``` holds the error code and text.
+- The server session fills ```xmlFile```, ```timeToCreate``` and ```timeToUpload``` before it sets ```jobStatus``` to ```done```.
+- If the file is not hosted, the export runs in the current session and the result also holds ```timeToCreate``` and ```timeToUpload```.
+
 ## Git Configuration
 
 - Set up a repository with a pipeline that calls [fm-saxml-delivery](https://github.com/soliantconsulting/fm-saxml-delivery)
@@ -59,7 +68,6 @@ Per server:
 
 ## Upgrade Instructions
 
-- Uninstall the add-on
-  - This will remove the table, layout, and scripts
-- Install the new add-on
-  - This will add the necessary table, layout, and scripts
+- Run the update script in `update/` (see its README). It updates installed files in place from any earlier version, without removing anything.
+- Or, uninstall the add-on and install the new one
+  - This will remove and re-add the table, layout, and scripts, which breaks any references to them
