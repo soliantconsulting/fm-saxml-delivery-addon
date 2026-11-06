@@ -16,7 +16,10 @@ The script does not touch privilege sets, because the one the pipeline uses has 
 
 1. Find the account the pipeline logs in with. Ask the user for its name; if they don't know, look for accounts that have the `fmrest` extended privilege (`filemaker help account read`) and ask which one it is. Never guess.
 2. Read that account's privilege set (`filemaker help privilegeSet read`, with `"detail":true`) and use only that set. Most custom sets can execute `saxmlDelivery_createXml`, so executing it does not identify the pipeline's set.
-3. Check how that set treats the fields of the `SaXMLDelivery` table. If it grants all fields, nothing is needed. If it lists fields individually, `jobStatus` and `jobMessage` need view only. Do not widen any other grant.
-4. Show the plan per set. After the user confirms, run `update:privilegeSet` with only the fields that need it (`filemaker help privilegeSet update`), then read the set back in a fresh process to verify.
+3. Check what that set grants, and propose only what is missing:
+   - Fields of the `SaXMLDelivery` table. If the set grants all fields, nothing is needed. If it lists fields individually, `jobStatus` and `jobMessage` need view only.
+   - The script `saxmlDelivery_getVersion`, which clients use to read the add-on version without starting an export. A set gets it from its entry for that script, or else from its grant for scripts without an entry (`newScripts` in the read). If that is `noAccess`, the script needs executable only (`scripts: [{"name":"saxmlDelivery_getVersion","access":"executableOnly"}]`). A set that grants all scripts needs nothing.
+   - Do not widen any other grant.
+4. Show the plan per set. After the user confirms, run `update:privilegeSet` with only the grants that are missing (`filemaker help privilegeSet update`), then read the set back in a fresh process and check each grant: the fields, and the script's effective access as in step 3.
 
 Report what was updated per file, what was already current, and anything skipped.

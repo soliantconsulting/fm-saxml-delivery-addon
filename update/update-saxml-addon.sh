@@ -49,7 +49,7 @@ trap 'rm -rf "$TMP"' EXIT
 cat > "$TMP/helper.py" <<'PY'
 import json, sys
 
-SCRIPTS = ["saxmlDelivery_createXml", "saxmlDelivery_readme", "saxmlDelivery_runPipeline"]
+SCRIPTS = ["saxmlDelivery_createXml", "saxmlDelivery_readme", "saxmlDelivery_runPipeline", "saxmlDelivery_getVersion"]
 TABLE = "SaXMLDelivery"
 LAYOUT = "SaXMLDeliveryExecutionContext"
 
@@ -106,12 +106,22 @@ def differing(src, tgt):
     a, b = norm(src), norm(tgt)
     return abs(len(a) - len(b)) + sum(1 for x, y in zip(a, b) if not within(x, y))
 
-def version(r):
-    s = r["scripts"].get("saxmlDelivery_createXml")
+def script_version(s):
     for st in (s or {}).get("body", []):
         if st.get("name") == "$addonVersion":
             return st["value"].strip('"')
-    return "unknown"
+    return None
+
+def version(r):
+    """The version a file reports: saxmlDelivery_getVersion has it from 0.2.2 on, saxmlDelivery_createXml always did."""
+    return (script_version(r["scripts"].get("saxmlDelivery_getVersion"))
+            or script_version(r["scripts"].get("saxmlDelivery_createXml")) or "unknown")
+
+def source_versions_agree(r):
+    """The version is written in both saxmlDelivery_getVersion and saxmlDelivery_createXml; they must say the same."""
+    a = script_version(r["scripts"].get("saxmlDelivery_getVersion"))
+    b = script_version(r["scripts"].get("saxmlDelivery_createXml"))
+    return a is not None and a == b, a, b
 
 def missing_fields(src, tgt):
     return [n for n in src["fields"] if n not in tgt["fields"]]
@@ -153,17 +163,34 @@ def layout_ops(src, tgt):
                 "addObjects": [conv(o) for o in src["layout"]["contents"]["objects"]]})
     return ops
 
+def script_access(s, name):
+    """A custom set's access to a script: its own entry, else the grant for scripts without one. None if the read has neither."""
+    scripts = s.get("scripts", {})
+    for e in scripts.get("scripts", []):
+        if e.get("name") == name:
+            return e.get("access")
+    return scripts.get("newScripts", {}).get("access")
+
 def privilege_sets_needing_grant(r):
-    """Custom privilege sets that list the table's fields one by one and give no access to a job field.
-    A set that grants all fields, or has no grant of its own for the table, covers new fields already."""
+    """Custom privilege sets that lack access to something the add-on added, each as 'name (what)'.
+      fields: the set lists the table's fields one by one and gives no access to a job field. A set that grants all
+              fields, or has no grant of its own for the table, covers new fields already.
+      script: the set can run saxmlDelivery_createXml but not saxmlDelivery_getVersion. A set that grants all
+              scripts, or gives new scripts access, covers it already."""
     out = []
     for s in r["privsets"]:
+        what = []
         for t in s.get("records", {}).get("tables", []):
             if t["name"] != TABLE or t.get("fields", {}).get("access") != "limited":
                 continue
             granted = {f["name"] for f in t["fields"].get("fields", []) if f.get("access") != "noAccess"}
             if not {"jobStatus", "jobMessage"} <= granted:
-                out.append(s["name"])
+                what.append("fields")
+        runs_createxml = script_access(s, "saxmlDelivery_createXml") not in (None, "noAccess")
+        if runs_createxml and script_access(s, "saxmlDelivery_getVersion") == "noAccess":
+            what.append("script")
+        if what:
+            out.append("%s (%s)" % (s["name"], ", ".join(what)))
     return out
 
 cmd = sys.argv[1]
@@ -215,6 +242,11 @@ elif cmd == "verify":
     bad += ["layout"] if layout_flat(src["layout"]) != layout_flat(tgt["layout"]) else []
     print("MISMATCH " + ", ".join(bad) if bad else "OK")
     sys.exit(1 if bad else 0)
+elif cmd == "checksource":
+    ok, a, b = source_versions_agree(reads(sys.argv[2]))
+    if not ok:
+        print("saxmlDelivery_getVersion says %s but saxmlDelivery_createXml says %s; fix the source file first" % (a, b))
+        sys.exit(1)
 elif cmd == "privneeds":
     print(", ".join(privilege_sets_needing_grant(reads(sys.argv[2]))))
 elif cmd == "errors":
@@ -240,6 +272,7 @@ cat > "$TMP/read.ndjson" <<'E'
 {"op":"read:script","name":"saxmlDelivery_createXml"}
 {"op":"read:script","name":"saxmlDelivery_readme"}
 {"op":"read:script","name":"saxmlDelivery_runPipeline"}
+{"op":"read:script","name":"saxmlDelivery_getVersion"}
 {"op":"read:field","table":"SaXMLDelivery","detail":true}
 {"op":"read:layout","name":"SaXMLDeliveryExecutionContext","detail":true}
 {"op":"read:privilegeSet","detail":true,"filter":{"builtIn":false}}
@@ -249,6 +282,7 @@ echo "Reading the latest definitions from $(basename "$SOURCE")"
 filemaker "--file=$SOURCE" "--username=$SOURCE_USER" "$TMP/read.ndjson" > "$TMP/source.txt" 2>&1
 H plan "$TMP/source.txt" "$TMP/source.txt" /dev/null /dev/null >/dev/null 2>"$TMP/err.txt" \
   || { echo "could not read the source file: $(cat "$TMP/err.txt")" >&2; exit 1; }
+H checksource "$TMP/source.txt" || exit 1
 echo "Latest version: $(H version "$TMP/source.txt")"
 
 declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=()
@@ -346,9 +380,9 @@ done
 
 echo; echo "== Summary"; printf '  %s\n' "${REPORT[@]}"
 if [ ${#NEEDS[@]} -gt 0 ]; then
-  echo; echo "These files have privilege sets that list the SaXMLDelivery fields one by one, with no access to jobStatus or jobMessage:"
+  echo; echo "These files have privilege sets that lack access to something the add-on added. fields: no access to jobStatus or jobMessage. script: cannot execute saxmlDelivery_getVersion."
   printf '  %s\n' "${NEEDS[@]}"
-  echo "If the account that reads the job record over the Data API uses one of them, it needs view access to both fields. To update them, give this prompt to Claude Code, started in this repo:"
+  echo "If the account that calls the add-on over the Data API uses one of them, it needs view access to both fields (fields) and execute access to the script (script). To update them, give this prompt to Claude Code, started in this repo:"
   echo
   files=$(IFS=,; for n in "${NEEDS[@]}"; do echo "${n%% (*}"; done | paste -sd, -)
   echo "  Follow update/update-saxml-addon.prompt.md, section 2 only, to update the privilege sets in $files${HOST:+ on $HOST}. The schema and scripts are already updated. Use the account $USERNAME."
