@@ -39,7 +39,9 @@ command -v filemaker >/dev/null || { echo "the filemaker command (part of ADK) i
 [ -f "$SOURCE" ] || { echo "missing $SOURCE" >&2; exit 1; }
 
 TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+now() { perl -MTime::HiRes=time -e 'printf "%.3f\n", time'; }  # bash 3.2 on macOS has no sub-second clock
+START=$(now)
+trap '[ -s "$TMP/timing.tsv" ] && H timing "$TMP/timing.tsv" "$(perl -e "printf q(%.3f), $(now) - $START")"; rm -rf "$TMP"' EXIT
 
 # Helper for the JSON work. The six reads (3 scripts, the fields, the layout) are the same for the
 # source and each target.
@@ -263,12 +265,50 @@ elif cmd == "openreason":
             break
     else:
         print("unknown error")
+elif cmd == "timing":
+    # timing.tsv rows: kind, file, ops, seconds. One row per filemaker call; each call opens and closes the file.
+    rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2]) if l.strip()]
+    wall = float(sys.argv[3])
+    order = [("source", "source read", False), ("connect", "connect only", False), ("read", "read", False),
+             ("dryrun", "dry run", False), ("create", "create", True), ("update", "update", True)]
+    print("\n== Timing (seconds, wall clock per filemaker call, including opening and closing the file)")
+    print("  %-14s %6s %6s %9s %9s" % ("call", "calls", "ops", "total", "avg/call"))
+    groups = {False: 0.0, True: 0.0}
+    for kind, label, writes in order:
+        rs = [r for r in rows if r[0] == kind]
+        if not rs:
+            continue
+        secs = sum(float(r[3]) for r in rs)
+        groups[writes] += secs
+        print("  %-14s %6d %6d %9.1f %9.1f" % (label, len(rs), sum(int(r[2]) for r in rs), secs, secs / len(rs)))
+    cli = groups[False] + groups[True]
+    print("  no changes (source read, connect, read, dry run): %.1f" % groups[False])
+    print("  changes (create, update): %.1f" % groups[True])
+    print("  filemaker total: %.1f of %.1f; the rest (%.1f) is outside the filemaker command" % (cli, wall, wall - cli))
+    files = []
+    for r in rows:
+        if r[0] != "source" and r[1] not in files:
+            files.append(r[1])
+    if files:
+        print("  per file:")
+        for f in files:
+            rs = [r for r in rows if r[1] == f]
+            print("    %-30s %3d calls %9.1f" % (f, len(rs), sum(float(r[3]) for r in rs)))
 PY
 
 H() { python3 -I "$TMP/helper.py" "$@"; }
+timed() { # timed <kind> <file> <ndjson> <command...>: runs the command and logs its time to timing.tsv
+  local kind=$1 f=$2 ops=$3 t0 n=0; shift 3
+  [ "$ops" = /dev/null ] || n=$(grep -c . "$ops")
+  t0=$(now); "$@"; local rc=$?
+  printf '%s\t%s\t%s\t%s\n' "$kind" "${f##*/}" "$n" "$(perl -e "printf q(%.3f), $(now) - $t0")" >> "$TMP/timing.tsv"
+  return $rc
+}
 run() { # run <file> <ndjson> [--dry-run] -> output in $TMP/out.txt
-  local f=$1 ops=$2; shift 2
-  filemaker "--file=$f" "--username=$USERNAME" --keychain --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
+  local f=$1 ops=$2 kind; shift 2
+  case $ops in /dev/null) kind=connect ;; */read.ndjson) kind=read ;; */c*.ndjson) kind=create ;; *) kind=update ;; esac
+  [ "${1:-}" = --dry-run ] && kind=dryrun
+  timed "$kind" "$f" "$ops" filemaker "--file=$f" "--username=$USERNAME" --keychain --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
 }
 hosted() { # a bare name goes to --host, without .fmp12; a path or fmnet:// address is used as given
   if [[ $1 != */* ]]; then
@@ -288,7 +328,7 @@ cat > "$TMP/read.ndjson" <<'E'
 E
 
 echo "Reading the latest definitions from $(basename "$SOURCE")"
-filemaker "--file=$SOURCE" "--username=$SOURCE_USER" "$TMP/read.ndjson" > "$TMP/source.txt" 2>&1
+timed source "$SOURCE" "$TMP/read.ndjson" filemaker "--file=$SOURCE" "--username=$SOURCE_USER" "$TMP/read.ndjson" > "$TMP/source.txt" 2>&1
 H plan "$TMP/source.txt" "$TMP/source.txt" /dev/null /dev/null >/dev/null 2>"$TMP/err.txt" \
   || { echo "could not read the source file: $(cat "$TMP/err.txt")" >&2; exit 1; }
 H checksource "$TMP/source.txt" || exit 1
