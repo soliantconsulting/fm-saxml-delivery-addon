@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SaXMLDelivery Manual Update</title>
+<style>
+  :root {
+    --bg: #fff; --text: #1d1d1f; --muted: #8a6d3b; --line: #e4e4e4; --stripe: #f5f5f5;
+    --accent: #c9a227; --link: #9b1c1c; --btn: #4a78c9; --btn-text: #fff; --gray-btn: #e6e6e6;
+    --add-bg: #d5edc8; --change-bg: #d9c8f0; --check-bg: #f6e0b5; --hover: #e6effb;
+  }
+  * { box-sizing: border-box; }
+  body { margin: 0; background: var(--bg); color: var(--text); font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Helvetica Neue", sans-serif; }
+  .toolbar { display: flex; align-items: center; gap: 16px; padding: 14px 16px; background: #f0f0f0; border-bottom: 1px solid #d6d6d6; flex-wrap: wrap; }
+  .toolbar h1 { margin: 0; font-size: 28px; font-weight: 700; }
+  .toolbar .spacer { flex: 1; }
+  .progress { color: #555; font-size: 14px; }
+  button { font: inherit; font-size: 13px; border: 0; border-radius: 4px; padding: 6px 12px; cursor: pointer; }
+  .primary { background: var(--btn); color: var(--btn-text); text-transform: uppercase; letter-spacing: .02em; }
+  .secondary { background: var(--gray-btn); color: #333; }
+  .green { background: #3c9a3c; color: #fff; text-transform: uppercase; }
+  .wrap { max-width: 1200px; margin: 0 auto; }
+  .context { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 18px 16px 6px; flex-wrap: wrap; }
+  .context h2 { margin: 0; font-size: 22px; }
+  .context h2 span { margin: 0 10px; }
+  .note { padding: 0 16px 10px; color: #555; font-size: 14px; }
+  .cols, .row { display: grid; grid-template-columns: 56px 88px 1fr 96px 56px; align-items: center; gap: 8px; padding: 8px 16px; }
+  .cols { color: var(--muted); font-size: 14px; border-bottom: 3px solid var(--accent); }
+  .cols .r, .row .r { text-align: right; }
+  .cols .c, .row .c { text-align: center; }
+  section { border-bottom: 1px solid var(--line); }
+  .sec-head { display: flex; align-items: center; justify-content: space-between; padding: 14px 16px 8px; border-bottom: 1px solid #ccc; }
+  .sec-head h3 { margin: 0; font-size: 16px; }
+  .row:nth-child(even) { background: var(--stripe); }
+  .row:hover { background: var(--hover); }
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 2px; font-size: 14px; }
+  .Add { background: var(--add-bg); } .Change { background: var(--change-bg); } .Check { background: var(--check-bg); }
+  .summary { color: var(--link); }
+  .summary small { display: block; color: #555; font-size: 13px; margin-top: 2px; }
+  .summary code { background: #f0ece4; padding: 0 4px; border-radius: 3px; font-size: 13px; color: #333; }
+  .row.done .summary { color: #999; text-decoration: line-through; }
+  .row.done .summary small, .row.done .summary code { text-decoration: none; }
+  .hide-done .row.done { display: none; }
+  input[type=checkbox] { width: 18px; height: 18px; cursor: pointer; }
+  .sec-total { text-align: right; padding: 6px 72px 10px 16px; color: #333; font-size: 14px; }
+  .grand { text-align: right; padding: 14px 72px 30px 16px; font-size: 15px; }
+  @media (max-width: 700px) {
+    .cols { display: none; }
+    .row { grid-template-columns: 32px 70px 1fr 36px; }
+    .row .time { display: none; }
+    .sec-total, .grand { padding-right: 16px; }
+  }
+</style>
+</head>
+<body>
+<div class="toolbar">
+  <h1>Task List</h1>
+  <button class="green" type="button" onclick="window.print()">Print</button>
+  <span class="spacer"></span>
+  <span class="progress" id="progress"></span>
+  <button class="primary" type="button" id="hideDone">Hide done</button>
+  <button class="secondary" type="button" id="clearAll">Clear all checkboxes</button>
+</div>
+<div class="wrap" id="list">
+  <div class="context">
+    <h2>Add-on: SaXMLDelivery<span>•</span>Update to 0.2.2<span>•</span>Manual (FileMaker Pro)</h2>
+  </div>
+  <p class="note">For a file on any 0.1.x or 0.2.x version that can't be updated with <code>update/update-saxml-addon.sh</code>. Back up the target file first. Open <code>src/SaXMLDelivery.fmp12</code> from this repo next to it, and work through the groups in order: the scripts and layout refer to the new fields.</p>
+  <div class="cols"><span>Order</span><span>Type</span><span>Task Summary</span><span class="r">Est. time</span><span class="c">Done</span></div>
+</div>
+
+<script>
+const GROUPS = [
+  { name: "Pre-Deployment", tasks: [
+    ["Change", "Back up the target file", "Take a copy, or confirm a recent server backup exists.", 5],
+  ]},
+  { name: "Field", tasks: [
+    ["Add", "Create field <code>jobStatus</code> in table <code>SaXMLDelivery</code>", "Text, stored. Comment: running | done | error. Skip if it exists (added in 0.2.0).", 3],
+    ["Add", "Create field <code>jobMessage</code> in table <code>SaXMLDelivery</code>", "Text, stored. Comment: Empty unless jobStatus is error. Skip if it exists (added in 0.2.0).", 3],
+    ["Add", "Create field <code>sizeInBytes_c</code> in table <code>SaXMLDelivery</code>", "Calculation, Number result, stored, context SaXMLDelivery: <code>GetContainerAttribute ( xmlFile ; \"filesize\" )</code>. Added in 0.2.1.", 3],
+  ]},
+  { name: "Layout Content", tasks: [
+    ["Change", "Set the body part height of <code>SaXMLDeliveryExecutionContext</code> to 781", "Before pasting, so the objects are not squeezed into a shorter body.", 2],
+    ["Change", "Replace all objects on <code>SaXMLDeliveryExecutionContext</code>", "Delete every object, then copy all objects from the same layout in the source file and paste them in place. Picks up the new fields and the v0.2.2 label.", 8],
+  ]},
+  { name: "Script", tasks: [
+    ["Change", "Replace the steps of <code>saxmlDelivery_createXml</code>", "Select all steps and delete them, then paste all steps from the source script. Don't delete the script: replacing steps keeps its ID, so callers keep working.", 5],
+    ["Change", "Replace the steps of <code>saxmlDelivery_readme</code>", "Same as above.", 3],
+    ["Add", "Paste script <code>saxmlDelivery_getVersion</code> into the SaXMLDelivery folder", "Copy it from the source file's Script Workspace. Keep it hidden, and leave Run with full access off.", 3],
+    ["Check", "Leave <code>saxmlDelivery_runPipeline</code> alone", "Unchanged since 0.1.13. Replace its steps only if the file is older than that.", 1],
+  ]},
+  { name: "Privilege Set", tasks: [
+    ["Change", "Data API account's set: view access to <code>jobStatus</code> and <code>jobMessage</code>", "Only if the set limits the SaXMLDelivery fields one by one. Without it, polling can't read the status.", 5],
+    ["Change", "Data API account's set: Executable only for <code>saxmlDelivery_getVersion</code>", "Only if the set limits scripts.", 3],
+  ]},
+  { name: "Post-Deployment", tasks: [
+    ["Check", "No <code>&lt;Field Missing&gt;</code> or <code>&lt;unknown&gt;</code> in the pasted scripts", "Search both replaced scripts and the new one.", 3],
+    ["Check", "Run <code>saxmlDelivery_getVersion</code>", "It returns <code>\"addonVersion\":\"0.2.2\"</code>.", 2],
+    ["Check", "Call <code>saxmlDelivery_createXml</code> on the hosted file", "It comes back with jobStatus = running, and the record turns done.", 10],
+  ]},
+];
+
+const KEY = "saxml-manual-update-0.2.2";
+let state = {};
+try { state = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { state = {}; }
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} };
+const hms = m => `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:00`;
+
+const list = document.getElementById("list");
+let order = 0, grand = 0;
+for (const g of GROUPS) {
+  const sec = document.createElement("section");
+  const total = g.tasks.reduce((s, t) => s + t[3], 0);
+  grand += total;
+  sec.innerHTML = `<div class="sec-head"><h3>${g.name} (${g.tasks.length})</h3></div>`;
+  for (const [type, title, detail, mins] of g.tasks) {
+    const id = "t" + (++order);
+    const row = document.createElement("label");
+    row.className = "row";
+    row.innerHTML = `<span>${order}</span><span><span class="badge ${type}">${type}</span></span>
+      <span class="summary">${title}<small>${detail}</small></span>
+      <span class="r time">${mins} min</span>
+      <span class="c"><input type="checkbox" data-id="${id}"></span>`;
+    const cb = row.querySelector("input");
+    cb.checked = !!state[id];
+    row.classList.toggle("done", cb.checked);
+    cb.addEventListener("change", () => { state[id] = cb.checked; row.classList.toggle("done", cb.checked); save(); progress(); });
+    sec.appendChild(row);
+  }
+  sec.insertAdjacentHTML("beforeend", `<div class="sec-total">${hms(total)}</div>`);
+  list.appendChild(sec);
+}
+list.insertAdjacentHTML("beforeend", `<div class="grand">Total ${hms(grand)}</div>`);
+
+function progress() {
+  const all = document.querySelectorAll("input[type=checkbox]");
+  const done = [...all].filter(c => c.checked).length;
+  document.getElementById("progress").textContent = `${done} / ${all.length} done`;
+}
+progress();
+
+document.getElementById("clearAll").addEventListener("click", () => {
+  document.querySelectorAll("input[type=checkbox]").forEach(c => { c.checked = false; c.closest(".row").classList.remove("done"); });
+  state = {}; save(); progress();
+});
+const hideBtn = document.getElementById("hideDone");
+hideBtn.addEventListener("click", () => {
+  const on = document.body.classList.toggle("hide-done");
+  hideBtn.textContent = on ? "Show done" : "Hide done";
+});
+</script>
+</body>
+</html>
