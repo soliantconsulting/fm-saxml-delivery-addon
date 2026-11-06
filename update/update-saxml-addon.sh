@@ -254,6 +254,15 @@ elif cmd == "errors":
         if o.get("status") == "error" or o.get("type") == "fatal":
             e = o["error"]
             print("    %s (dbError %s): %s" % (e.get("code"), e.get("dbError", "-"), e.get("message", "")[:240]))
+elif cmd == "openreason":
+    reasons = {212: "login failed", 714: "account is not [Full Access]", 802: "no file by that name",
+               803: "host not found or file in use", 303: "schema is locked by another session"}
+    for o in lines(sys.argv[2]):
+        if o.get("status") == "error" or o.get("type") == "fatal":
+            print(reasons.get(o["error"].get("dbError"), o["error"].get("code") or "unknown error"))
+            break
+    else:
+        print("unknown error")
 PY
 
 H() { python3 -I "$TMP/helper.py" "$@"; }
@@ -300,7 +309,7 @@ for t in "${TARGETS[@]}"; do
     REACHABLE+=("$t")
   else
     echo "  cannot open it, so it will be skipped:"; H errors "$TMP/out.txt"
-    REPORT+=("$t: skipped (could not open: login or connection failed)")
+    REPORT+=("$t: skipped (could not open: $(H openreason "$TMP/out.txt"))")
   fi
 done
 [ ${#REACHABLE[@]} -gt 0 ] || { echo; echo "No file could be opened."; printf '  %s\n' "${REPORT[@]}"; exit 1; }
