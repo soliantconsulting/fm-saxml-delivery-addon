@@ -1,6 +1,6 @@
 # fm-saxml-delivery-addon
 
-Version 0.2.1
+Version 0.2.2
 
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
@@ -36,6 +36,7 @@ Per FileMaker database file:
     - All no access
   - Custom script privileges
     - ```saxmlDelivery_createXml``` script: Executable only
+    - ```saxmlDelivery_getVersion``` script: Executable only (optional; lets a client read the add-on version without starting an export)
     - All other scripts: No access
   - Extended privileges
     - fmrest
@@ -55,6 +56,7 @@ The ```saxmlDelivery_createXml``` script is asynchronous when the file is hosted
 - The caller polls the record on the ```SaXMLDeliveryExecutionContext``` layout until ```jobStatus``` is ```done``` or ```error```. On ```error```, ```jobMessage``` holds the error code and text.
 - The server session fills ```xmlFile```, ```timeToCreate``` and ```timeToUpload``` before it sets ```jobStatus``` to ```done```.
 - If the file is not hosted, the export runs in the current session and the result also holds ```timeToCreate``` and ```timeToUpload```.
+- ```saxmlDelivery_getVersion``` is a read-only script that takes no parameter, creates no record and starts no export. It returns ```{ errorCode: 0, message: "", data: { addonVersion } }```. Call it over the Data API on the ```SaXMLDeliveryExecutionContext``` layout to read the installed add-on version.
 - ```sizeInBytes_c``` is the size of the file in ```xmlFile```. It is empty when the container is empty, so to find records that still hold an xml file, search ```sizeInBytes_c``` for ```>0``` on the ```SaXMLDeliveryExecutionContext``` layout.
 
 ## Git Configuration
