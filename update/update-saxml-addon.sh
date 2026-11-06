@@ -195,19 +195,16 @@ def privilege_sets_needing_grant(r):
             out.append("%s (%s)" % (s["name"], ", ".join(what)))
     return out
 
-cmd = sys.argv[1]
-if cmd == "version":
-    print(version(reads(sys.argv[2])))
-elif cmd == "plan":
-    src, tgt = reads(sys.argv[2]), reads(sys.argv[3])
+def plan(src, tgt, say=print):
+    """The creates and the script updates that bring tgt up to the source, printing a line per element."""
     if all(v is None for v in tgt["scripts"].values()) and not tgt["fields"]:
-        print("NOT-INSTALLED")
+        say("NOT-INSTALLED")
         sys.exit(2)
     if tgt["layout"] is None:
         print("ERROR the layout %s is missing; reinstall the add-on" % LAYOUT, file=sys.stderr)
         sys.exit(3)
     creates, updates = [], []
-    print("  installed version %s, latest %s" % (version(tgt), version(src)))
+    say("  installed version %s, latest %s" % (version(tgt), version(src)))
     for n in missing_fields(src, tgt):
         f = src["fields"][n]
         op = {"op": "create:field", "table": TABLE, "name": n, "type": f["type"]}
@@ -215,28 +212,79 @@ elif cmd == "plan":
             if k in f:
                 op[k] = f[k]
         creates.append(op)
-        print("  field %-24s CREATE" % n)
+        say("  field %-24s CREATE" % n)
     if layout_flat(src["layout"]) != layout_flat(tgt["layout"]):
         creates += layout_ops(src, tgt)
-        print("  layout %-26s REPLACE OBJECTS" % LAYOUT)
+        say("  layout %-26s REPLACE OBJECTS" % LAYOUT)
     else:
-        print("  layout %-26s unchanged" % LAYOUT)
+        say("  layout %-26s unchanged" % LAYOUT)
     for n in SCRIPTS:
         s, t = src["scripts"][n], tgt["scripts"][n]
         if t is None:
             creates.append({"op": "create:script", "name": n, "folder": s["folder"], "hidden": s["hidden"],
                             "runWithFullAccess": s["runWithFullAccess"], "body": s["body"]})
-            print("  script %-26s CREATE (%d steps)" % (n, s["steps"]))
+            say("  script %-26s CREATE (%d steps)" % (n, s["steps"]))
         else:
             d = differing(s["body"], t["body"])
             if d == 0:
-                print("  script %-26s unchanged" % n)
+                say("  script %-26s unchanged" % n)
             else:
                 updates.append({"op": "update:script", "name": n, "token": t["token"], "body": s["body"]})
-                print("  script %-26s UPDATE (%d -> %d steps, %d differ)" % (n, t["steps"], s["steps"], d))
+                say("  script %-26s UPDATE (%d -> %d steps, %d differ)" % (n, t["steps"], s["steps"], d))
+    return creates, updates
+
+cmd = sys.argv[1]
+if cmd == "version":
+    print(version(reads(sys.argv[2])))
+elif cmd == "plan":
+    creates, updates = plan(reads(sys.argv[2]), reads(sys.argv[3]))
     open(sys.argv[4], "w").write("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in creates))
     open(sys.argv[5], "w").write("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in updates))
     print("NOTHING-TO-DO" if not creates and not updates else "CHANGES")
+elif cmd == "session":
+    # session <source.txt> <read.ndjson> <creates> <updates> <out> <filemaker args...>
+    # Applies the creates and the script updates in one filemaker run, so the file is opened once and the whole
+    # update commits or rolls back as one batch. filemaker answers each op as it arrives on stdin, so after the
+    # creates the file is read again in the same run: creating invalidates the update ops' tokens, and the
+    # updates are planned again from that read.
+    import subprocess
+    src = reads(sys.argv[2])
+    read_ops = [l for l in open(sys.argv[3]) if l.strip()]
+    creates = [l for l in open(sys.argv[4]) if l.strip()]
+    updates = [l for l in open(sys.argv[5]) if l.strip()]
+    out = open(sys.argv[6], "w")
+    err = open(sys.argv[6] + ".err", "w+")  # a file, not a pipe, so a full stderr pipe cannot stall the run
+    p = subprocess.Popen(["filemaker"] + sys.argv[7:], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=err, text=True, bufsize=1)
+    def send(ops):
+        """Sends ops one by one and returns their results; stops at the first error or if filemaker ends."""
+        res = []
+        for op in ops:
+            p.stdin.write(op if op.endswith("\n") else op + "\n"); p.stdin.flush()
+            line = p.stdout.readline()
+            if not line:
+                return res, False
+            out.write(line)
+            res.append(line)
+            if json.loads(line).get("status") == "error":
+                return res, False
+        return res, True
+    ok = True
+    if creates:
+        _, ok = send(creates)
+        if ok:
+            res, ok = send(read_ops)
+            if ok:
+                open(sys.argv[6] + ".read", "w").write("".join(res))
+                _, updates = plan(src, reads(sys.argv[6] + ".read"), say=lambda *a: None)
+                updates = [json.dumps(o, ensure_ascii=False) for o in updates]
+    if ok and updates:
+        _, ok = send(updates)
+    p.stdin.close()
+    out.write(p.stdout.read())
+    rc = p.wait()
+    err.seek(0); out.write(err.read())
+    sys.exit(rc or (0 if ok else 1))
 elif cmd == "verify":
     src, tgt = reads(sys.argv[2]), reads(sys.argv[3])
     bad = [n for n in SCRIPTS if tgt["scripts"][n] is None or differing(src["scripts"][n]["body"], tgt["scripts"][n]["body"])]
@@ -269,8 +317,8 @@ elif cmd == "timing":
     # timing.tsv rows: kind, file, ops, seconds. One row per filemaker call; each call opens and closes the file.
     rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2]) if l.strip()]
     wall = float(sys.argv[3])
-    order = [("source", "source read", False), ("connect", "connect only", False), ("read", "read", False),
-             ("dryrun", "dry run", False), ("create", "create", True), ("update", "update", True)]
+    order = [("source", "source read", False), ("read", "read", False),
+             ("dryrun", "dry run", False), ("apply", "apply", True)]
     print("\n== Timing (seconds, wall clock per filemaker call, including opening and closing the file)")
     print("  %-14s %6s %6s %9s %9s" % ("call", "calls", "ops", "total", "avg/call"))
     groups = {False: 0.0, True: 0.0}
@@ -282,8 +330,8 @@ elif cmd == "timing":
         groups[writes] += secs
         print("  %-14s %6d %6d %9.1f %9.1f" % (label, len(rs), sum(int(r[2]) for r in rs), secs, secs / len(rs)))
     cli = groups[False] + groups[True]
-    print("  no changes (source read, connect, read, dry run): %.1f" % groups[False])
-    print("  changes (create, update): %.1f" % groups[True])
+    print("  no changes (source read, read, dry run): %.1f" % groups[False])
+    print("  changes (apply): %.1f" % groups[True])
     print("  filemaker total: %.1f of %.1f; the rest (%.1f) is outside the filemaker command" % (cli, wall, wall - cli))
     files = []
     for r in rows:
@@ -306,9 +354,15 @@ timed() { # timed <kind> <file> <ndjson> <command...>: runs the command and logs
 }
 run() { # run <file> <ndjson> [--dry-run] -> output in $TMP/out.txt
   local f=$1 ops=$2 kind; shift 2
-  case $ops in /dev/null) kind=connect ;; */read.ndjson) kind=read ;; */c*.ndjson) kind=create ;; *) kind=update ;; esac
-  [ "${1:-}" = --dry-run ] && kind=dryrun
+  kind=read
   timed "$kind" "$f" "$ops" filemaker "--file=$f" "--username=$USERNAME" --keychain --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
+}
+session() { # session <i> <file> [--dry-run]: the creates and updates for file i in one filemaker run -> $TMP/out.txt
+  local i=$1 f=$2 kind=apply; shift 2
+  [ "${1:-}" = --dry-run ] && kind=dryrun
+  cat "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/cu$i.ndjson"  # only to count the ops for the timing
+  timed "$kind" "$f" "$TMP/cu$i.ndjson" H session "$TMP/source.txt" "$TMP/read.ndjson" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/out.txt" \
+    "--file=$f" "--username=$USERNAME" --keychain --prompt "$@"
 }
 hosted() { # a bare name goes to --host, without .fmp12; a path or fmnet:// address is used as given
   if [[ $1 != */* ]]; then
@@ -336,17 +390,16 @@ echo "Latest version: $(H version "$TMP/source.txt")"
 
 declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=()
 
-# Phase 0: ask for every password up front. Opening a file with no operations settles its
-# credentials and changes nothing, and FileMaker offers to keep the password in the keychain,
-# so the later phases need no prompts as long as you accept that offer.
+# Phase 0: read every file, which also asks for every password up front. FileMaker offers to keep
+# the password in the keychain, so the later phases need no prompts as long as you accept that offer.
 echo; echo "== Passwords"
 echo "If a password window appears, enter the password there."
 for t in "${TARGETS[@]}"; do
   f=$(hosted "$t")
   echo "$t"
-  run "$f" /dev/null
+  run "$f" "$TMP/read.ndjson"
   if grep -q '"type":"summary"' "$TMP/out.txt" && ! grep -q '"type":"fatal"' "$TMP/out.txt"; then
-    REACHABLE+=("$t")
+    REACHABLE+=("$t"); cp "$TMP/out.txt" "$TMP/r${#REACHABLE[@]}.txt"
   else
     echo "  cannot open it, so it will be skipped:"; H errors "$TMP/out.txt"
     REPORT+=("$t: skipped (could not open: $(H openreason "$TMP/out.txt"))")
@@ -355,13 +408,12 @@ done
 [ ${#REACHABLE[@]} -gt 0 ] || { echo; echo "No file could be opened."; printf '  %s\n' "${REPORT[@]}"; exit 1; }
 if [ $APPLY -eq 1 ]; then echo; echo "== Plan (--apply: the update follows straight away)"; else echo; echo "== Dry run"; fi
 
-# Phase 1: plan every file. A dry run also asks the file to check each operation without writing.
+# Phase 1: plan every file from its read. A dry run also asks the file to check the ops without writing.
 i=0
 for t in "${REACHABLE[@]}"; do
   i=$((i+1)); f=$(hosted "$t")
   echo "$t  ($f)"
-  run "$f" "$TMP/read.ndjson"
-  if ! H plan "$TMP/source.txt" "$TMP/out.txt" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/plan.txt" 2>"$TMP/err.txt"; then
+  if ! H plan "$TMP/source.txt" "$TMP/r$i.txt" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/plan.txt" 2>"$TMP/err.txt"; then
     if grep -q NOT-INSTALLED "$TMP/plan.txt"; then
       echo "  skipped: the add-on is not installed in this file"; REPORT+=("$t: skipped (add-on not installed)")
     else
@@ -372,15 +424,8 @@ for t in "${REACHABLE[@]}"; do
   grep -v -E '^(CHANGES|NOTHING-TO-DO)$' "$TMP/plan.txt"
   if grep -q NOTHING-TO-DO "$TMP/plan.txt"; then REPORT+=("$t: already up to date"); continue; fi
   if [ $APPLY -eq 0 ]; then
-    bad=0
-    for ops in "$TMP/c$i.ndjson" "$TMP/u$i.ndjson"; do
-      [ -s "$ops" ] || continue
-      # Script updates may use fields that the creates add, so they can only be checked once those exist.
-      if [ "$ops" = "$TMP/u$i.ndjson" ] && [ -s "$TMP/c$i.ndjson" ]; then echo "  script updates are checked after the creates are applied"; continue; fi
-      run "$f" "$ops" --dry-run
-      if ! grep -q '"errors":0' "$TMP/out.txt"; then bad=1; echo "  dry run refused:"; H errors "$TMP/out.txt"; fi
-    done
-    if [ $bad -eq 1 ]; then REPORT+=("$t: failed dry run"); continue; fi
+    session "$i" "$f" --dry-run
+    if ! grep -q '"errors":0' "$TMP/out.txt"; then echo "  dry run refused:"; H errors "$TMP/out.txt"; REPORT+=("$t: failed dry run"); continue; fi
     REPORT+=("$t: would be updated")
   fi
   OK_TARGETS+=("$i|$t|$f")
@@ -396,25 +441,14 @@ if [ $APPLY -eq 0 ]; then
   exit 0
 fi
 
-# Phase 2: apply, then verify from a fresh read.
+# Phase 2: apply each file in one run (creates, a fresh read, then script updates), then verify from a new read.
 echo; echo "== Apply"
 for entry in "${OK_TARGETS[@]}"; do
   IFS='|' read -r i t f <<< "$entry"
   echo "$t"
   failed=0
-  if [ -s "$TMP/c$i.ndjson" ]; then
-    run "$f" "$TMP/c$i.ndjson"
-    grep -q '"errors":0' "$TMP/out.txt" && grep -q '"rolledBack":false' "$TMP/out.txt" || { failed=1; H errors "$TMP/out.txt"; }
-    # Creating fields and scripts invalidates earlier tokens, so plan the updates again from a fresh read.
-    if [ $failed -eq 0 ]; then
-      run "$f" "$TMP/read.ndjson"
-      H plan "$TMP/source.txt" "$TMP/out.txt" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" >/dev/null 2>&1 || failed=1
-    fi
-  fi
-  if [ $failed -eq 0 ] && [ -s "$TMP/u$i.ndjson" ]; then
-    run "$f" "$TMP/u$i.ndjson"
-    grep -q '"errors":0' "$TMP/out.txt" && grep -q '"rolledBack":false' "$TMP/out.txt" || { failed=1; H errors "$TMP/out.txt"; }
-  fi
+  session "$i" "$f"
+  grep -q '"errors":0' "$TMP/out.txt" && grep -q '"rolledBack":false' "$TMP/out.txt" || { failed=1; H errors "$TMP/out.txt"; }
   if [ $failed -eq 0 ]; then
     run "$f" "$TMP/read.ndjson"
     v=$(H verify "$TMP/source.txt" "$TMP/out.txt" 2>&1) && { echo "  updated and verified"; REPORT+=("$t: updated and verified"); UPDATED+=("$t")
