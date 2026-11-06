@@ -182,7 +182,7 @@ elif cmd == "plan":
     for n in missing_fields(src, tgt):
         f = src["fields"][n]
         op = {"op": "create:field", "table": TABLE, "name": n, "type": f["type"]}
-        for k in ("fieldType", "comment", "options"):
+        for k in ("fieldType", "comment", "calculation", "options"):
             if k in f:
                 op[k] = f[k]
         creates.append(op)
