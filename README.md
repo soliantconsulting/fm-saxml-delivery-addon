@@ -1,6 +1,6 @@
 # fm-saxml-delivery-addon
 
-Version 0.2.0
+Version 0.2.1
 
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
@@ -55,6 +55,7 @@ The ```saxmlDelivery_createXml``` script is asynchronous when the file is hosted
 - The caller polls the record on the ```SaXMLDeliveryExecutionContext``` layout until ```jobStatus``` is ```done``` or ```error```. On ```error```, ```jobMessage``` holds the error code and text.
 - The server session fills ```xmlFile```, ```timeToCreate``` and ```timeToUpload``` before it sets ```jobStatus``` to ```done```.
 - If the file is not hosted, the export runs in the current session and the result also holds ```timeToCreate``` and ```timeToUpload```.
+- ```sizeInBytes_c``` is the size of the file in ```xmlFile```. It is empty when the container is empty, so to find records that still hold an xml file, search ```sizeInBytes_c``` for ```>0``` on the ```SaXMLDeliveryExecutionContext``` layout.
 
 ## Git Configuration
 
