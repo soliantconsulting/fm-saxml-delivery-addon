@@ -1,6 +1,6 @@
 # fm-saxml-delivery-addon
 
-Version 0.2.2
+Version 0.2.3
 
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
@@ -28,6 +28,7 @@ Per FileMaker database file:
   - Suggested name: 'SaXML Delivery'
   - Custom record privileges
     - ```SaXMLDelivery``` table: View + Edit + 'modifiable' for ```xmlFile``` field; 'read only' for ```jobStatus``` and ```jobMessage``` ('no access' for all other fields)
+    - Base tables that table occurrences in other files are based on: View (Edit, Create and Delete no; field access none). See [Multi-file solutions](#multi-file-solutions).
     - All other tables: No access
   - Custom layout privileges
     - ```SaXMLDeliveryExecutionContext``` layout: View only (layout), Modifiable (records)
@@ -43,6 +44,17 @@ Per FileMaker database file:
 - Create an account that uses that privilege set
   - Suggested name: 'saxml'
 
+### Multi-file solutions
+
+`saxmlDelivery_createXml` runs with full access in its own file, but FileMaker opens the files that its external data sources point to with the pipeline account's own privilege set. If that set cannot view the records of a base table, the SaXML leaves out every table occurrence based on that table, and the relationships, layouts and value lists that use them point at table occurrences that are not there. The export reports no error.
+
+So in every file the solution uses:
+
+- The pipeline account must exist, with the same name and password, on a privilege set like the one above.
+- That set needs View on the records of each base table that table occurrences in other files are based on. Edit, Create and Delete can stay no, field access can stay none, and it needs no layout access.
+
+This is a security trade-off: the account can read those records through the Data API if it is ever given a layout on those tables. A file that only references others, and is referenced by none, needs no extra table access.
+
 Per server:
 
 - Install a valid SSL certificate (required by the Data API)
@@ -56,6 +68,7 @@ The ```saxmlDelivery_createXml``` script is asynchronous when the file is hosted
 - The caller polls the record on the ```SaXMLDeliveryExecutionContext``` layout until ```jobStatus``` is ```done``` or ```error```. On ```error```, ```jobMessage``` holds the error code and text.
 - The server session fills ```xmlFile```, ```timeToCreate``` and ```timeToUpload``` before it sets ```jobStatus``` to ```done```.
 - If the file is not hosted, the export runs in the current session and the result also holds ```timeToCreate``` and ```timeToUpload```.
+- If the pipeline account cannot view its own ```SaXMLDelivery``` record, the job never reports ```done``` and the caller polls until it times out.
 - ```saxmlDelivery_getVersion``` is a read-only script that takes no parameter, creates no record and starts no export. It returns ```{ errorCode: 0, message: "", data: { addonVersion } }```. Call it over the Data API on the ```SaXMLDeliveryExecutionContext``` layout to read the installed add-on version.
 - ```sizeInBytes_c``` is the size of the file in ```xmlFile```. It is empty when the container is empty, so to find records that still hold an xml file, search ```sizeInBytes_c``` for ```>0``` on the ```SaXMLDeliveryExecutionContext``` layout.
 
