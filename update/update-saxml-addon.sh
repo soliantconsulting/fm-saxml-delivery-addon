@@ -388,7 +388,17 @@ H plan "$TMP/source.txt" "$TMP/source.txt" /dev/null /dev/null >/dev/null 2>"$TM
 H checksource "$TMP/source.txt" || exit 1
 echo "Latest version: $(H version "$TMP/source.txt")"
 
-declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=()
+declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=() PRE023=()
+
+# 0.2.3 changed no schema; it marks files whose pipeline account may lack record access in other files.
+below_023() { [ -n "$1" ] && [ "$1" != 0.2.3 ] && [ "$(printf '%s\n' "$1" 0.2.3 | sort -V | head -1)" = "$1" ]; }
+multifile_note() {
+  [ ${#PRE023[@]} -gt 0 ] || return 0
+  echo; echo "Check the pipeline account's record access in ${PRE023[*]} and every file their solution uses (see \"Multi-file solutions\" in README.md):"
+  echo "  FileMaker opens other files with that account's own privilege set, even though the export runs with full access. Where it cannot"
+  echo "  view a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. This script"
+  echo "  does not change privilege sets; section 2 of update/update-saxml-addon.prompt.md checks them."
+}
 
 # Phase 0: read every file, which also asks for every password up front. FileMaker offers to keep
 # the password in the keychain, so the later phases need no prompts as long as you accept that offer.
@@ -423,6 +433,7 @@ for t in "${REACHABLE[@]}"; do
   fi
   grep -v -E '^(CHANGES|NOTHING-TO-DO)$' "$TMP/plan.txt"
   if grep -q NOTHING-TO-DO "$TMP/plan.txt"; then REPORT+=("$t: already up to date"); continue; fi
+  below_023 "$(H version "$TMP/r$i.txt" 2>/dev/null)" && PRE023+=("$t")
   if [ $APPLY -eq 0 ]; then
     session "$i" "$f" --dry-run
     if ! grep -q '"errors":0' "$TMP/out.txt"; then echo "  dry run refused:"; H errors "$TMP/out.txt"; REPORT+=("$t: failed dry run"); continue; fi
@@ -437,6 +448,7 @@ fi
 
 if [ $APPLY -eq 0 ]; then
   echo; echo "== Summary (dry run)"; printf '  %s\n' "${REPORT[@]}"
+  multifile_note
   echo; echo "Dry run only: nothing was changed. Back the files up, close Manage Database and the script editor in each, then run again with --apply to update ${#OK_TARGETS[@]} file(s)."
   exit 0
 fi
@@ -470,3 +482,4 @@ if [ ${#NEEDS[@]} -gt 0 ]; then
   files=$(IFS=,; for n in "${NEEDS[@]}"; do echo "${n%% (*}"; done | paste -sd, -)
   echo "  Follow update/update-saxml-addon.prompt.md, section 2 only, to update the privilege sets in $files${HOST:+ on $HOST}. The schema and scripts are already updated. Use the account $USERNAME."
 fi
+multifile_note
