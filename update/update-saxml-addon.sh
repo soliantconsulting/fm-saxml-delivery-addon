@@ -280,7 +280,8 @@ def addon_grants(r, s):
         entry["name"] = TABLE
         tables.append(entry)
     for n in ("saxmlDelivery_createXml", "saxmlDelivery_getVersion"):
-        if r["scripts"].get(n) is not None and script_access(s, n) in (None, "noAccess"):
+        # a script the file lacks is created by this run before the grant is sent, so it needs the grant too
+        if r["scripts"].get(n) is None or script_access(s, n) in (None, "noAccess"):
             scripts.append({"name": n, "access": "executableOnly"})
     l = layout_grant(s, LAYOUT)
     if l.get("access") in (None, "noAccess") or l.get("records") != "modifiable":
