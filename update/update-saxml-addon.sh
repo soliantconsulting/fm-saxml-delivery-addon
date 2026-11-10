@@ -322,6 +322,16 @@ def cross_file_needs(files):
                          "resolved here; check that file's privileges by hand" % (a, ds, ", ".join(paths[ds]), len(tos)))
     return needs, warns
 
+def fields_visible(g):
+    """True when the account can at least view every field of the table, so calculations keep the field names.
+    View only on all fields reads back as access "limited" with newFields viewOnly; only noAccess shows <No Access>."""
+    f = g.get("fields", {})
+    if f.get("access") == "all":
+        return True
+    if f.get("access") != "limited":
+        return False
+    return f.get("newFields", {}).get("access", "noAccess") != "noAccess" and all(x.get("access") != "noAccess" for x in f.get("fields", []))
+
 def privilege_plan(files, account, field_access=False):
     """{label: (update:privilegeSet op or None, [plan lines])} for the export account in every file.
     field_access: also grant field access all where View is yes or limited, instead of only noting it."""
@@ -341,16 +351,16 @@ def privilege_plan(files, account, field_access=False):
             if s.get("builtIn") or table in named:
                 continue
             if g.get("view") == "limited" and g.get("viewCalculation", {}).get("text", "").strip() == "False" \
-                    and g.get("fields", {}).get("access") != "all":
+                    and not fields_visible(g):
                 # no record passes False, so field access all exposes nothing; 0.2.4 wrote none here
                 tables.append({"name": table, "fields": {"access": "all"}})
                 say.append("  table %-26s field access all (View is limited by False; field access none breaks calculation text)" % table)
                 continue
             if g.get("view") in ("yes", "limited"):
-                if g.get("fields", {}).get("access") != "all" and field_access:
+                if not fields_visible(g) and field_access:
                     tables.append({"name": table, "fields": {"access": "all"}})
                     say.append("  table %-26s field access all (View is %s; otherwise calculations show <No Access>)" % (table, g["view"]))
-                elif g.get("fields", {}).get("access") != "all":
+                elif not fields_visible(g):
                     # Changing this would widen what the account reads (View yes) or need a judgment call, so say it.
                     notes.append("%s: field access is %s, so other files' calculations show its fields as <No Access> in the SaXML; "
                                  "give the export account field access all on it, or run with --grant-field-access" % (table, g.get("fields", {}).get("access", "none")))
