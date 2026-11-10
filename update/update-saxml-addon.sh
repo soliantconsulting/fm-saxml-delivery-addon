@@ -20,6 +20,9 @@
 #   - in every file: View limited by False on each base table that table occurrences in the other files use, so the
 #     SaXML keeps those table occurrences while the account sees no record
 # It only ever adds access, and never deletes anything.
+#
+# Hosted files are processed at the same time, each in one filemaker session from the first read to the commit.
+# Local files are processed one at a time, because a session locks the files its data sources point to.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -410,98 +413,345 @@ elif cmd == "plan":
     open(sys.argv[4], "w").write("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in creates))
     open(sys.argv[5], "w").write("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in updates))
     print("NOTHING-TO-DO" if not creates and not updates else "CHANGES")
-elif cmd == "session":
-    # session <source.txt> <read.ndjson> <creates> <updates> <privileges> <out> <filemaker args...>
-    # Applies the creates, the script updates and the privilege grants in one filemaker run, so the file is opened
-    # once and the whole update commits or rolls back as one batch. filemaker answers each op as it arrives on
-    # stdin, so after the creates the file is read again in the same run: creating invalidates the update ops'
-    # tokens, and the updates are planned again from that read.
-    import subprocess
-    src = reads(sys.argv[2])
-    read_ops = [l for l in open(sys.argv[3]) if l.strip()]
-    creates = [l for l in open(sys.argv[4]) if l.strip()]
-    updates = [l for l in open(sys.argv[5]) if l.strip()]
-    grants = [l for l in open(sys.argv[6]) if l.strip()]
-    sys.argv[6:7] = []
-    out = open(sys.argv[6], "w")
-    err = open(sys.argv[6] + ".err", "w+")  # a file, not a pipe, so a full stderr pipe cannot stall the run
-    p = subprocess.Popen(["filemaker"] + sys.argv[7:], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                         stderr=err, text=True, bufsize=1)
-    def send(ops):
-        """Sends ops one by one and returns their results; stops at the first error or if filemaker ends."""
-        res = []
-        for op in ops:
-            p.stdin.write(op if op.endswith("\n") else op + "\n"); p.stdin.flush()
-            line = p.stdout.readline()
-            if not line:
-                return res, False
-            out.write(line)
-            res.append(line)
-            if json.loads(line).get("status") == "error":
-                return res, False
-        return res, True
-    ok = True
-    if creates:
-        _, ok = send(creates)
-        if ok:
-            res, ok = send(read_ops)
-            if ok:
-                open(sys.argv[6] + ".read", "w").write("".join(res))
-                _, updates = plan(src, reads(sys.argv[6] + ".read"), say=lambda *a: None)
-                updates = [json.dumps(o, ensure_ascii=False) for o in updates]
-    if ok and updates:
-        _, ok = send(updates)
-    if ok and grants:
-        _, ok = send(grants)
-    p.stdin.close()
-    out.write(p.stdout.read())
-    rc = p.wait()
-    err.seek(0); out.write(err.read())
-    sys.exit(rc or (0 if ok else 1))
-elif cmd == "verify":
-    src, tgt = reads(sys.argv[2]), reads(sys.argv[3])
-    bad = [n for n in SCRIPTS if tgt["scripts"][n] is None or differing(src["scripts"][n]["body"], tgt["scripts"][n]["body"])]
-    bad += ["field " + n for n in missing_fields(src, tgt)]
-    bad += ["layout"] if layout_flat(src["layout"]) != layout_flat(tgt["layout"]) else []
-    print("MISMATCH " + ", ".join(bad) if bad else "OK")
-    sys.exit(1 if bad else 0)
 elif cmd == "checksource":
     ok, a, b = source_versions_agree(reads(sys.argv[2]))
     if not ok:
         print("saxmlDelivery_getVersion says %s but saxmlDelivery_createXml says %s; fix the source file first" % (a, b))
         sys.exit(1)
-elif cmd == "privplan":
-    # privplan <account> <list.tsv>: rows of index, label, read file. Writes p<index>.ndjson next to each read,
-    # prints the plan per file, and exits 1 when any file still needs a grant (used to verify after the apply).
-    rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[3]) if l.strip()]
-    files = {lab: reads(path) for _, lab, path in rows}
-    plans, warns = privilege_plan(files, sys.argv[2])
-    pending = False
-    for i, lab, path in rows:
-        op, say = plans[lab]
-        print(lab)
-        print("\n".join(say))
-        pending |= op is not None
-        open(path.rsplit("/", 1)[0] + "/p%s.ndjson" % i, "w").write(json.dumps(op, ensure_ascii=False) + "\n" if op else "")
-    for w in warns:
-        print("  WARNING " + w)
-    sys.exit(10 if pending else 0)
-elif cmd == "privneeds":
-    print(", ".join(privilege_sets_needing_grant(reads(sys.argv[2]))))
-elif cmd == "errors":
-    for o in lines(sys.argv[2]):
-        if o.get("status") == "error" or o.get("type") == "fatal":
-            e = o["error"]
-            print("    %s (dbError %s): %s" % (e.get("code"), e.get("dbError", "-"), e.get("message", "")[:240]))
-elif cmd == "openreason":
-    reasons = {212: "login failed", 714: "account is not [Full Access]", 802: "no file by that name",
+elif cmd == "multi":
+    # multi <source.txt> <read.ndjson> <tmpdir> <apply 0|1> <grant 0|1> <export account or ""> -- <label|address>... -- <filemaker args>
+    # Each file gets ONE filemaker session, and all files run at once. A session reads its file, waits until every file
+    # has been read (the privilege plan needs all of them), sends its creates, updates and grants, reads the file again
+    # in the same session (reads see the uncommitted writes) to verify, and commits when its input closes. Under --apply
+    # nothing is committed until every file has been verified; a file that fails rolls back on its own.
+    import subprocess, threading, time
+    from concurrent.futures import ThreadPoolExecutor
+    src_path, read_path, tmp, apply_, grant, export = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6] == "1", sys.argv[7]
+    rest = sys.argv[8:]
+    i1 = rest.index("--"); i2 = rest.index("--", i1 + 1)
+    targets = [t.split("|", 1) for t in rest[i1 + 1:i2]]
+    fm_args = rest[i2 + 1:]
+    src = reads(src_path)
+    read_ops = [l.rstrip("\n") for l in open(read_path) if l.strip()]
+    timing = open(tmp + "/timing.tsv", "a")
+    REASONS = {212: "login failed", 714: "account is not [Full Access]", 802: "no file by that name",
                803: "host not found or file in use", 303: "schema is locked by another session"}
-    for o in lines(sys.argv[2]):
-        if o.get("status") == "error" or o.get("type") == "fatal":
-            print(reasons.get(o["error"].get("dbError"), o["error"].get("code") or "unknown error"))
-            break
+
+    class Session:
+        def __init__(self, label, address):
+            self.label, self.address, self.out = label, address, []
+            self.start()
+        def start(self):
+            self.raw, self.ok, self.ops = [], True, 0
+            self.t0 = time.time()
+            self.err = open("%s/%s.err" % (tmp, self.label), "w+")
+            self.p = subprocess.Popen(["filemaker", "--file=" + self.address, "--timeout=0"] + fm_args + (["--dry-run"] if not apply_ else []),
+                                      stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=self.err, text=True, bufsize=1)
+        def say(self, s=""):
+            self.out.append(s)
+        def send(self, ops, reads_only=False):
+            """Results of ops sent one by one; stops at the first error, or when filemaker ends (self.ok False).
+            With reads_only an error result (a script the file lacks) is an answer, not a failure."""
+            res = []
+            for op in ops:
+                if not self.ok:
+                    break
+                try:
+                    self.p.stdin.write((op if isinstance(op, str) else json.dumps(op, ensure_ascii=False)) + "\n"); self.p.stdin.flush()
+                except BrokenPipeError:
+                    self.ok = False; break
+                self.ops += 1
+                while True:
+                    line = self.p.stdout.readline()
+                    if not line:
+                        self.ok = False; break
+                    self.raw.append(line)
+                    try:
+                        o = json.loads(line)
+                    except ValueError:
+                        continue
+                    if o.get("type") == "fatal":
+                        self.ok = False; break
+                    if "op" in o:
+                        res.append(line)
+                        if o.get("status") == "error" and not reads_only:
+                            self.ok = False
+                        break
+            return res
+        def close(self, kind=None):
+            try:
+                self.p.stdin.close()
+            except BrokenPipeError:
+                pass
+            self.raw += self.p.stdout.readlines()
+            self.p.wait()
+            self.err.seek(0)
+            self.raw += self.err.readlines()  # the summary, fatal errors and credential records go to stderr
+            timing.write("%s\t%s\t%d\t%.3f\n" % (kind or ("apply" if apply_ else "dryrun"), self.label, self.ops, time.time() - self.t0)); timing.flush()
+            summ = [json.loads(l) for l in self.raw if l.startswith('{"type":"summary"')]
+            return bool(summ) and summ[-1].get("errors") == 0 and not summ[-1].get("rolledBack")
+        def errors(self):
+            for l in self.raw:
+                try:
+                    o = json.loads(l)
+                except ValueError:
+                    continue
+                if o.get("status") == "error" or o.get("type") == "fatal":
+                    e = o["error"]
+                    yield "    %s (dbError %s): %s" % (e.get("code"), e.get("dbError", "-"), e.get("message", "")[:240])
+        def reason(self):
+            for l in self.raw:
+                try:
+                    o = json.loads(l)
+                except ValueError:
+                    continue
+                if o.get("status") == "error" or o.get("type") == "fatal":
+                    return REASONS.get(o["error"].get("dbError"), o["error"].get("code") or "unknown error")
+            return "unknown error"
+
+    def below(v, ref):
+        try:
+            return tuple(int(x) for x in v.split(".")) < tuple(int(x) for x in ref.split("."))
+        except (AttributeError, ValueError):
+            return False
+
+    # Hosted files run at the same time, each held open from the first read to the commit. Local files can't: a
+    # session opens the files its data sources point to, which locks them for the others. So local files run one
+    # at a time, opened once to read and once to write.
+    hold = all(addr.startswith("fmnet://") for _, addr in targets)
+    sessions = []
+    if hold:
+        for n, (lab, addr) in enumerate(targets):
+            if n:
+                time.sleep(1.5)  # starting many filemaker processes at the same instant can fail to start the network stack
+            sessions.append(Session(lab, addr))
+    reads_of = {}
+    def open_error(s):
+        for l in s.raw:
+            try:
+                o = json.loads(l)
+            except ValueError:
+                continue
+            if o.get("type") == "fatal":
+                return o["error"].get("dbError") or o["error"].get("code")
+        return None
+    def first_read(s):
+        # Opening several files at once sometimes fails for no lasting reason: FileMaker Server answers 802 (no such
+        # file), or the local network stack does not start (network_init_failed). Retry those; a refused login is not.
+        for attempt in range(4):
+            lines = s.send(read_ops, reads_only=True)
+            if s.ok or attempt == 3:
+                break
+            s.close("read")
+            if open_error(s) not in (802, "network_init_failed"):
+                s.closed = True
+                break
+            time.sleep(2 + 3 * attempt)
+            s.start()
+        s.first = lines
+        s.bad = {i for i, l in enumerate(lines) if json.loads(l).get("status") == "error"}
+        if s.ok and len(lines) == len(read_ops):
+            path = "%s/%s.r.txt" % (tmp, s.label)
+            open(path, "w").write("".join(lines))
+            try:
+                reads_of[s.label] = reads(path)
+            except SystemExit as e:
+                s.ok = False; s.fail = str(e)
+        else:
+            s.ok = False
+    print("\n== Reading %d file(s)%s" % (len(targets), " at once" if hold else ""))
+    print("If a password window appears, enter the password there.")
+    if hold:
+        with ThreadPoolExecutor(max_workers=len(sessions) or 1) as ex:
+            list(ex.map(first_read, sessions))
     else:
-        print("unknown error")
+        for lab, addr in targets:
+            s = Session(lab, addr); sessions.append(s)
+            first_read(s)
+            if not getattr(s, "closed", False):
+                s.close("read")
+            s.closed = True
+    report, pre023, pskip, needs_sets = [], [], [], []
+    live = []
+    for s in sessions:
+        if s.label in reads_of:
+            live.append(s)
+        else:
+            if not getattr(s, "closed", False):
+                s.close("read")
+            print("%s: cannot open it, so it will be skipped:" % s.label)
+            for e in s.errors():
+                print(e)
+            report.append("%s: skipped (could not open: %s)" % (s.label, s.reason()))
+    if not live:
+        print("\nNo file could be opened.")
+        print("\n".join("  " + r for r in report))
+        sys.exit(1)
+
+    grants = {s.label: None for s in live}
+    if export:
+        print("\n== Privileges of the export account %s" % export)
+        plans, warns = privilege_plan({s.label: reads_of[s.label] for s in live}, export)
+        for s in live:
+            op, say = plans[s.label]
+            print(s.label); print("\n".join(say))
+            grants[s.label] = op
+        for w in warns:
+            print("  WARNING " + w)
+    print("\n== Plan (--apply: the update follows straight away)" if apply_ else "\n== Dry run")
+
+    def reread(s, created):
+        """Reads the file again in its session. Skips the reads that failed the first time (a script the file lacks,
+        the add-on's table in a file without the add-on), because under --abort-on-error any error result rolls the
+        whole session back, and puts the first answers in their place. A script just created is read again."""
+        names = {c["name"] for c in created if c.get("op") == "create:script"}
+        send = [i for i in range(len(read_ops)) if i not in s.bad or (i < len(SCRIPTS) and SCRIPTS[i] in names)]
+        got = s.send([read_ops[i] for i in send], reads_only=True)
+        if not s.ok or len(got) != len(send):
+            s.ok = False
+            return None
+        lines = list(s.first)
+        for i, l in zip(send, got):
+            lines[i] = l
+        path = "%s/%s.%d.txt" % (tmp, s.label, len(s.raw)); open(path, "w").write("".join(lines))
+        return reads(path)
+
+    def work(s):
+        """Plans and sends this file's ops, then reads it again in the session. Returns its status word."""
+        tgt = reads_of[s.label]
+        s.say("%s  (%s)" % (s.label, s.address))
+        installed = True
+        try:
+            creates, updates = plan(src, tgt, say=lambda l: l == "NOT-INSTALLED" or s.say(l))
+        except SystemExit as e:
+            if e.code == 2:
+                installed, creates, updates = False, [], []
+                s.say("  the add-on is not installed in this file")
+            else:
+                s.say("  failed: the layout %s is missing; reinstall the add-on" % LAYOUT)
+                return "failed", installed
+        s.installed = installed
+        if creates or updates:
+            if installed and below(version(tgt), "0.2.3"):
+                pre023.append(s.label)
+        g = grants[s.label]
+        if g:
+            s.say("  privilege grants planned (see above)")
+            if apply_ and not grant:
+                pskip.append(s.label); g = None
+        if not creates and not updates and not g:
+            return ("up to date" if installed else "not installed"), installed
+        if not hold or s.bad:
+            if hold:
+                s.close("read")  # its error results would roll the writes back; start clean
+            s.start()
+            s.opened = True
+        s.send(creates)
+        if s.ok and creates:
+            again = reread(s, creates)
+            if s.ok:
+                _, updates = plan(src, again, say=lambda *a: None)
+        if s.ok:
+            s.send(updates)
+        if s.ok and g:
+            s.send([g])
+        if not s.ok:
+            return "failed", installed
+        if apply_:
+            s.post = reread(s, creates)
+            if not s.ok:
+                return "failed", installed
+            if installed:
+                bad = [n for n in SCRIPTS if s.post["scripts"][n] is None or differing(src["scripts"][n]["body"], s.post["scripts"][n]["body"])]
+                bad += ["field " + n for n in missing_fields(src, s.post)]
+                bad += ["layout"] if layout_flat(src["layout"]) != layout_flat(s.post["layout"]) else []
+                if bad:
+                    s.verify_failed = ", ".join(bad)
+                    return "verify failed", installed
+        return "changed", installed
+
+    if hold:
+        with ThreadPoolExecutor(max_workers=len(live)) as ex:
+            results = list(ex.map(work, live))
+        # commit (or end the dry run) for every file, then print each file's lines in the order given
+        with ThreadPoolExecutor(max_workers=len(live)) as ex:
+            closed = list(ex.map(lambda s: s.close() or (bool(s.bad) and not getattr(s, "opened", False)), live))
+    else:
+        results, closed = [], []
+        for s in live:
+            results.append(work(s))
+            closed.append(s.close() if getattr(s, "opened", False) else True)
+    # a file with nothing to send has nothing to commit
+    closed = [c or st in ("up to date", "not installed") for c, (st, _) in zip(closed, results)]
+    for s, (status, installed), committed in zip(live, results, closed):
+        print("\n".join(s.out))
+        if status == "changed" and not committed:
+            status = "failed"
+        if status == "failed":
+            print("  failed:")
+            for e in s.errors():
+                print(e)
+            print("  This file was rolled back and may need a rerun. A lock error (303, 3313, 3315) means someone has Manage Database or the script editor open.")
+            report.append("%s: failed" % s.label)
+        elif status == "verify failed":
+            print("  verify failed: MISMATCH " + s.verify_failed)
+            report.append("%s: applied but verify failed (MISMATCH %s)" % (s.label, s.verify_failed))
+        elif status == "up to date":
+            report.append("%s: already up to date" % s.label)
+        elif status == "not installed":
+            report.append("%s: add-on not installed, nothing to grant" % s.label)
+        elif not apply_:
+            report.append("%s: would be updated" % s.label)
+        elif installed:
+            print("  updated and verified"); report.append("%s: updated and verified" % s.label)
+            n = privilege_sets_needing_grant(s.post)
+            if n and not export:
+                needs_sets.append("%s (%s)" % (s.label, ", ".join(n)))
+        else:
+            print("  privileges applied"); report.append("%s: privileges applied" % s.label)
+    changed = [s for s, (st, _) in zip(live, results) if st == "changed"]
+
+    def skipped_note():
+        if pskip:
+            print("\nPrivilege grants were planned but not applied in %s. Rerun with --grant-privileges to apply them." % " ".join(pskip))
+    def multifile_note():
+        if pre023 and not export:
+            print("\nCheck the pipeline account's record access in %s and every file their solution uses (see \"Multi-file solutions\" in README.md):" % " ".join(pre023))
+            print("  FileMaker opens other files with that account's own privilege set, even though the export runs with full access. Where it cannot")
+            print("  access a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. View limited by False fixes it without showing any record.")
+            print("  Run again with every file of the solution and --export-account=<the pipeline's account> to check and set it.")
+
+    if not changed and not any(st in ("failed", "verify failed") for st, _ in results):
+        print("\nNothing to apply.")
+        print("\n".join("  " + r for r in report))
+        skipped_note()
+        sys.exit(0)
+    if not apply_:
+        print("\n== Summary (dry run)"); print("\n".join("  " + r for r in report))
+        multifile_note()
+        print("\nDry run only: nothing was changed. Back the files up, close Manage Database and the script editor in each, then run again with --apply%s to update %d file(s)."
+              % (" (and --grant-privileges for the privilege grants)" if export else "", len(changed)))
+        sys.exit(0)
+    print("\n== Summary"); print("\n".join("  " + r for r in report))
+    if export and grant:
+        print("\n== Privileges after the update")
+        after = {s.label: (getattr(s, "post", None) or reads_of[s.label]) for s in live}
+        plans, warns = privilege_plan(after, export)
+        if all(op is None for op, _ in plans.values()):
+            print("  verified: the export account has everything it needs in every file")
+        else:
+            for lab, (op, say) in plans.items():
+                for l in say[1:] if op is not None else [l for l in say if l.strip().startswith(("NOTE", "PROBLEM"))]:
+                    print("  still missing: %s: %s" % (lab, l.strip()))
+            for w in warns:
+                print("  still missing: WARNING " + w)
+    elif needs_sets:
+        print("\nThese files have privilege sets that lack access to something the add-on added. fields: no access to jobStatus or jobMessage. script: cannot execute saxmlDelivery_getVersion.")
+        print("\n".join("  " + n for n in needs_sets))
+        print("If the Data API account uses one of them, rerun with every file of the solution, --export-account=<that account> and --grant-privileges.")
+    skipped_note()
+    multifile_note()
+    sys.exit(1 if any(st in ("failed", "verify failed") for st, _ in results) or not all(closed) else 0)
 elif cmd == "timing":
     # timing.tsv rows: kind, file, ops, seconds. One row per filemaker call; each call opens and closes the file.
     rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2]) if l.strip()]
@@ -521,7 +771,7 @@ elif cmd == "timing":
     cli = groups[False] + groups[True]
     print("  no changes (source read, read, dry run): %.1f" % groups[False])
     print("  changes (apply): %.1f" % groups[True])
-    print("  filemaker total: %.1f of %.1f; the rest (%.1f) is outside the filemaker command" % (cli, wall, wall - cli))
+    print("  filemaker total: %.1f; wall clock %.1f (the files run at the same time, so the total can exceed it)" % (cli, wall))
     files = []
     for r in rows:
         if r[0] != "source" and r[1] not in files:
@@ -540,18 +790,6 @@ timed() { # timed <kind> <file> <ndjson> <command...>: runs the command and logs
   t0=$(now); "$@"; local rc=$?
   printf '%s\t%s\t%s\t%s\n' "$kind" "${f##*/}" "$n" "$(perl -e "printf q(%.3f), $(now) - $t0")" >> "$TMP/timing.tsv"
   return $rc
-}
-run() { # run <file> <ndjson> [--dry-run] -> output in $TMP/out.txt
-  local f=$1 ops=$2 kind; shift 2
-  kind=read
-  timed "$kind" "$f" "$ops" filemaker "--file=$f" "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
-}
-session() { # session <i> <file> [--dry-run]: the creates, updates and grants for file i in one filemaker run -> $TMP/out.txt
-  local i=$1 f=$2 kind=apply; shift 2
-  [ "${1:-}" = --dry-run ] && kind=dryrun
-  cat "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/p$i.ndjson" > "$TMP/cu$i.ndjson"  # only to count the ops for the timing
-  timed "$kind" "$f" "$TMP/cu$i.ndjson" H session "$TMP/source.txt" "$TMP/read.ndjson" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/p$i.ndjson" "$TMP/out.txt" \
-    "--file=$f" "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt "$@"
 }
 hosted() { # a bare name goes to --host, without .fmp12; a path or fmnet:// address is used as given
   if [[ $1 != */* ]]; then
@@ -580,139 +818,8 @@ H plan "$TMP/source.txt" "$TMP/source.txt" /dev/null /dev/null >/dev/null 2>"$TM
 H checksource "$TMP/source.txt" || exit 1
 echo "Latest version: $(H version "$TMP/source.txt")"
 
-declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=() PRE023=() PSKIP=()
-
-# 0.2.3 changed no schema; it marks files whose pipeline account may lack record access in other files.
-below_023() { [ -n "$1" ] && [ "$1" != 0.2.3 ] && [ "$(printf '%s\n' "$1" 0.2.3 | sort -V | head -1)" = "$1" ]; }
-multifile_note() {
-  [ ${#PRE023[@]} -gt 0 ] || return 0
-  echo; echo "Check the pipeline account's record access in ${PRE023[*]} and every file their solution uses (see \"Multi-file solutions\" in README.md):"
-  echo "  FileMaker opens other files with that account's own privilege set, even though the export runs with full access. Where it cannot"
-  echo "  access a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. View limited by False fixes it without showing any record."
-  echo "  Run again with every file of the solution and --export-account=<the pipeline's account> to check and set it."
-}
-
-# Phase 0: read every file, which also asks for every password up front. FileMaker offers to keep
-# the password in the keychain, so the later phases need no prompts as long as you accept that offer.
-echo; echo "== Passwords"
-echo "If a password window appears, enter the password there."
-for t in "${TARGETS[@]}"; do
-  f=$(hosted "$t")
-  echo "$t"
-  run "$f" "$TMP/read.ndjson"
-  if grep -q '"type":"summary"' "$TMP/out.txt" && ! grep -q '"type":"fatal"' "$TMP/out.txt"; then
-    REACHABLE+=("$t"); cp "$TMP/out.txt" "$TMP/r${#REACHABLE[@]}.txt"
-  else
-    echo "  cannot open it, so it will be skipped:"; H errors "$TMP/out.txt"
-    REPORT+=("$t: skipped (could not open: $(H openreason "$TMP/out.txt"))")
-  fi
-done
-[ ${#REACHABLE[@]} -gt 0 ] || { echo; echo "No file could be opened."; printf '  %s\n' "${REPORT[@]}"; exit 1; }
-if [ $APPLY -eq 1 ]; then echo; echo "== Plan (--apply: the update follows straight away)"; else echo; echo "== Dry run"; fi
-
-label() { local n=${1##*/}; echo "${n%.fmp12}"; }
-plist() { # plist <tsv> [<verify read prefix>]: index, file name, read file for every reachable file
-  local i=0 t r; : > "$1"
-  for t in "${REACHABLE[@]}"; do
-    i=$((i+1)); r="$TMP/r$i.txt"; [ -n "${2:-}" ] && [ -f "$TMP/$2$i.txt" ] && r="$TMP/$2$i.txt"
-    printf '%s\t%s\t%s\n' "$i" "$(label "$(hosted "$t")")" "$r" >> "$1"
-  done
-}
-
-# Privileges: planned across all files at once, because a file needs access for the table occurrences of the others.
-i=0; for t in "${REACHABLE[@]}"; do i=$((i+1)); : > "$TMP/p$i.ndjson"; done
-if [ -n "$EXPORT" ]; then
-  echo; echo "== Privileges of the export account $EXPORT"
-  plist "$TMP/files.tsv"
-  H privplan "$EXPORT" "$TMP/files.tsv"
-  rc=$?; [ $rc -eq 0 ] || [ $rc -eq 10 ] || { echo "could not plan the privileges" >&2; exit 1; }
-fi
-if [ $APPLY -eq 1 ]; then echo; echo "== Plan (--apply: the update follows straight away)"; else echo; echo "== Dry run"; fi
-
-# Phase 1: plan every file from its read. A dry run also asks the file to check the ops without writing.
-i=0
-for t in "${REACHABLE[@]}"; do
-  i=$((i+1)); f=$(hosted "$t"); installed=1; schema=0
-  echo "$t  ($f)"
-  : > "$TMP/c$i.ndjson"; : > "$TMP/u$i.ndjson"
-  if H plan "$TMP/source.txt" "$TMP/r$i.txt" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/plan.txt" 2>"$TMP/err.txt"; then
-    grep -v -E '^(CHANGES|NOTHING-TO-DO)$' "$TMP/plan.txt"
-    if grep -q CHANGES "$TMP/plan.txt"; then schema=1; below_023 "$(H version "$TMP/r$i.txt" 2>/dev/null)" && PRE023+=("$t"); fi
-  elif grep -q NOT-INSTALLED "$TMP/plan.txt"; then
-    installed=0; echo "  the add-on is not installed in this file"
-  else
-    echo "  failed: $(cat "$TMP/err.txt")"; REPORT+=("$t: failed ($(cat "$TMP/err.txt"))"); continue
-  fi
-  if [ -s "$TMP/p$i.ndjson" ]; then
-    echo "  privilege grants planned (see above)"
-    if [ $APPLY -eq 1 ] && [ $GRANT -eq 0 ]; then PSKIP+=("$t"); : > "$TMP/p$i.ndjson"; fi
-  fi
-  if [ $schema -eq 0 ] && [ ! -s "$TMP/p$i.ndjson" ]; then
-    if [ $installed -eq 1 ]; then REPORT+=("$t: already up to date"); else REPORT+=("$t: add-on not installed, nothing to grant"); fi
-    continue
-  fi
-  if [ $APPLY -eq 0 ]; then
-    session "$i" "$f" --dry-run
-    if ! grep -q '"errors":0' "$TMP/out.txt"; then echo "  dry run refused:"; H errors "$TMP/out.txt"; REPORT+=("$t: failed dry run"); continue; fi
-    REPORT+=("$t: would be updated")
-  fi
-  OK_TARGETS+=("$i|$t|$f|$installed")
-done
-
-skipped_note() {
-  [ ${#PSKIP[@]} -gt 0 ] || return 0
-  echo; echo "Privilege grants were planned but not applied in ${PSKIP[*]}. Rerun with --grant-privileges to apply them."
-}
-
-if [ ${#OK_TARGETS[@]} -eq 0 ]; then
-  echo; echo "Nothing to apply."; printf '  %s\n' "${REPORT[@]}"; skipped_note; exit 0
-fi
-
-if [ $APPLY -eq 0 ]; then
-  echo; echo "== Summary (dry run)"; printf '  %s\n' "${REPORT[@]}"
-  [ -n "$EXPORT" ] || multifile_note
-  echo; echo "Dry run only: nothing was changed. Back the files up, close Manage Database and the script editor in each, then run again with --apply${EXPORT:+ (and --grant-privileges for the privilege grants)} to update ${#OK_TARGETS[@]} file(s)."
-  exit 0
-fi
-
-# Phase 2: apply each file in one run (creates, a fresh read, script updates, grants), then verify from a new read.
-echo; echo "== Apply"
-for entry in "${OK_TARGETS[@]}"; do
-  IFS='|' read -r i t f installed <<< "$entry"
-  echo "$t"
-  failed=0
-  session "$i" "$f"
-  grep -q '"errors":0' "$TMP/out.txt" && grep -q '"rolledBack":false' "$TMP/out.txt" || { failed=1; H errors "$TMP/out.txt"; }
-  if [ $failed -eq 0 ]; then
-    run "$f" "$TMP/read.ndjson"; cp "$TMP/out.txt" "$TMP/v$i.txt"
-    if [ "$installed" = 0 ]; then
-      echo "  privileges applied"; REPORT+=("$t: privileges applied"); UPDATED+=("$t")
-    elif v=$(H verify "$TMP/source.txt" "$TMP/out.txt" 2>&1); then
-      echo "  updated and verified"; REPORT+=("$t: updated and verified"); UPDATED+=("$t")
-      sets=$(H privneeds "$TMP/out.txt" 2>/dev/null)
-      if [ -n "$sets" ]; then NEEDS+=("$t ($sets)"); fi
-    else
-      echo "  verify failed: $v"; REPORT+=("$t: applied but verify failed ($v)")
-    fi
-  else
-    echo "  failed (see above); this file may need a rerun. A lock error (303, 3313, 3315) means someone has Manage Database or the script editor open."
-    REPORT+=("$t: failed")
-  fi
-done
-
-echo; echo "== Summary"; printf '  %s\n' "${REPORT[@]}"
-if [ -n "$EXPORT" ] && [ $GRANT -eq 1 ]; then
-  echo; echo "== Privileges after the update"
-  plist "$TMP/files2.tsv" v
-  if H privplan "$EXPORT" "$TMP/files2.tsv" > "$TMP/pcheck.txt"; then
-    echo "  verified: the export account has everything it needs in every file"
-  else
-    grep -E 'PROBLEM|NOTE|WARNING|^  (table|script|layout|privilege set .*:$)' "$TMP/pcheck.txt" | grep -v 'nothing needed' | sed 's/^/  still missing: /'
-  fi
-elif [ ${#NEEDS[@]} -gt 0 ]; then
-  echo; echo "These files have privilege sets that lack access to something the add-on added. fields: no access to jobStatus or jobMessage. script: cannot execute saxmlDelivery_getVersion."
-  printf '  %s\n' "${NEEDS[@]}"
-  echo "If the Data API account uses one of them, rerun with every file of the solution, --export-account=<that account> and --grant-privileges."
-fi
-skipped_note
-[ -n "$EXPORT" ] || multifile_note
+# Every file at once, one filemaker session each; see the multi command in the helper.
+ARGS=()
+for t in "${TARGETS[@]}"; do f=$(hosted "$t"); n=${f##*/}; ARGS+=("${n%.fmp12}|$f"); done
+H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" -- "${ARGS[@]}" -- \
+  "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt
