@@ -8,6 +8,8 @@
 # privileges in every file given, so list every file of the solution. --grant-privileges, with --apply, applies them.
 # --credentials-from=<address> reads the keychain password stored for that file (spelled as --file is) for every
 # target, so files that share the account need one stored password instead of one each.
+# --grant-field-access, with --grant-privileges, also gives the export account field access all on cross-file tables
+# where its View is yes or limited (without it those only get a NOTE), so other files' calculations keep field names.
 # --jobs=<n> opens and works on at most n hosted files at once (default 3).
 #
 # It compares each installed file with the source and, for what differs:
@@ -30,7 +32,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=${SOURCE:-$HERE/../src/SaXMLDelivery.fmp12}
 SOURCE_USER=${SOURCE_USER:-Admin}
 
-USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 JOBS=3 CREDS=() TARGETS=()
+USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 FIELDS=0 JOBS=3 CREDS=() TARGETS=()
 for a in "$@"; do
   case $a in
     --username=*) USERNAME=${a#*=} ;;
@@ -38,6 +40,7 @@ for a in "$@"; do
     --apply) APPLY=1 ;;
     --export-account=*) EXPORT=${a#*=} ;;
     --grant-privileges) GRANT=1 ;;
+    --grant-field-access) FIELDS=1 ;;
     --credentials-from=*) CREDS=("$a") ;;
     --jobs=*) JOBS=${a#*=}; [[ $JOBS =~ ^[1-9][0-9]*$ ]] || { echo "--jobs needs a positive number" >&2; exit 64; } ;;
     --*) echo "unknown option: $a" >&2; exit 64 ;;
@@ -50,6 +53,7 @@ for a in "$@"; do
 done
 [ -n "$USERNAME" ] && [ ${#TARGETS[@]} -gt 0 ] || { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 [ $GRANT -eq 0 ] || [ -n "$EXPORT" ] || { echo "--grant-privileges needs --export-account=<name>" >&2; exit 64; }
+[ $FIELDS -eq 0 ] || [ $GRANT -eq 1 ] || { echo "--grant-field-access needs --grant-privileges" >&2; exit 64; }
 for t in "${TARGETS[@]}"; do
   [[ $t == */* || -n $HOST ]] || { echo "$t is a bare name; give --host=<host> or a full path" >&2; exit 64; }
 done
@@ -318,8 +322,9 @@ def cross_file_needs(files):
                          "resolved here; check that file's privileges by hand" % (a, ds, ", ".join(paths[ds]), len(tos)))
     return needs, warns
 
-def privilege_plan(files, account):
-    """{label: (update:privilegeSet op or None, [plan lines])} for the export account in every file."""
+def privilege_plan(files, account, field_access=False):
+    """{label: (update:privilegeSet op or None, [plan lines])} for the export account in every file.
+    field_access: also grant field access all where View is yes or limited, instead of only noting it."""
     needs, warns = cross_file_needs(files)
     out = {}
     for label, r in files.items():
@@ -342,10 +347,13 @@ def privilege_plan(files, account):
                 say.append("  table %-26s field access all (View is limited by False; field access none breaks calculation text)" % table)
                 continue
             if g.get("view") in ("yes", "limited"):
-                if g.get("fields", {}).get("access") != "all":
+                if g.get("fields", {}).get("access") != "all" and field_access:
+                    tables.append({"name": table, "fields": {"access": "all"}})
+                    say.append("  table %-26s field access all (View is %s; otherwise calculations show <No Access>)" % (table, g["view"]))
+                elif g.get("fields", {}).get("access") != "all":
                     # Changing this would widen what the account reads (View yes) or need a judgment call, so say it.
                     notes.append("%s: field access is %s, so other files' calculations show its fields as <No Access> in the SaXML; "
-                                 "give the export account field access all on it" % (table, g.get("fields", {}).get("access", "none")))
+                                 "give the export account field access all on it, or run with --grant-field-access" % (table, g.get("fields", {}).get("access", "none")))
                 continue
             to = next((o["name"] for o in r["tos"] if not o.get("table", {}).get("dataSource") and o.get("table", {}).get("name") == table), None)
             if to is None:
@@ -444,7 +452,8 @@ elif cmd == "multi":
     import subprocess, threading, time
     from concurrent.futures import ThreadPoolExecutor
     src_path, read_path, tmp, apply_, grant, export, jobs = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6] == "1", sys.argv[7], int(sys.argv[8])
-    rest = sys.argv[9:]
+    field_access = sys.argv[9] == "1"
+    rest = sys.argv[10:]
     i1 = rest.index("--"); i2 = rest.index("--", i1 + 1)
     targets = [t.split("|", 1) for t in rest[i1 + 1:i2]]
     fm_args = rest[i2 + 1:]
@@ -615,7 +624,7 @@ elif cmd == "multi":
     grants = {s.label: None for s in live}
     if export:
         print("\n== Privileges of the export account %s" % export)
-        plans, warns = privilege_plan({s.label: reads_of[s.label] for s in live}, export)
+        plans, warns = privilege_plan({s.label: reads_of[s.label] for s in live}, export, field_access)
         for s in live:
             op, say = plans[s.label]
             print(s.label); print("\n".join(say))
@@ -761,7 +770,7 @@ elif cmd == "multi":
     if export and grant:
         print("\n== Privileges after the update")
         after = {s.label: (getattr(s, "post", None) or reads_of[s.label]) for s in live}
-        plans, warns = privilege_plan(after, export)
+        plans, warns = privilege_plan(after, export, field_access)
         if all(op is None for op, _ in plans.values()):
             print("  verified: the export account has everything it needs in every file")
         else:
@@ -847,5 +856,5 @@ echo "Latest version: $(H version "$TMP/source.txt")"
 # Every file at once, one filemaker session each; see the multi command in the helper.
 ARGS=()
 for t in "${TARGETS[@]}"; do f=$(hosted "$t"); n=${f##*/}; ARGS+=("${n%.fmp12}|$f"); done
-H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" "$JOBS" -- "${ARGS[@]}" -- \
+H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" "$JOBS" "$FIELDS" -- "${ARGS[@]}" -- \
   "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt
