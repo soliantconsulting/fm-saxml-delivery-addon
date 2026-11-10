@@ -19,4 +19,4 @@ Without `--apply` it does a dry run:
 
 ## Part 2: Complete the update using an AI agent
 
-The script does not update privilege sets. To update those too, ask your AI agent from this repo: "Follow update/update-saxml-addon.prompt.md to update the SaXML add-on in <files>". It runs this script, then finds the privilege sets the pipeline's account uses and grants access to the new fields after you confirm. It also checks that the account can view the records of base tables that other files' table occurrences are based on (see "Multi-file solutions" in the main README), and asks separately before granting that.
+The script does not update privilege sets. To update those too, ask your AI agent from this repo: "Follow update/update-saxml-addon.prompt.md to update the SaXML add-on in <files>". It runs this script, then finds the privilege sets the pipeline's account uses and grants access to the new fields after you confirm. It also checks that the account has View 'limited' with `False` (or more) on base tables that other files' table occurrences are based on (see "Multi-file solutions" in the main README), and asks separately before setting that.

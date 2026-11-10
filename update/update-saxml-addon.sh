@@ -396,7 +396,7 @@ multifile_note() {
   [ ${#PRE023[@]} -gt 0 ] || return 0
   echo; echo "Check the pipeline account's record access in ${PRE023[*]} and every file their solution uses (see \"Multi-file solutions\" in README.md):"
   echo "  FileMaker opens other files with that account's own privilege set, even though the export runs with full access. Where it cannot"
-  echo "  view a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. This script"
+  echo "  access a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. View limited by False fixes it without showing any record. This script"
   echo "  does not change privilege sets; section 2 of update/update-saxml-addon.prompt.md checks them."
 }
 
