@@ -215,8 +215,9 @@ def privilege_sets_needing_grant(r):
 # --- Privileges of the export account (the account the pipeline calls the add-on with over the Data API) ---
 # Built-in sets other than [Read-Only Access] grant everything the export needs.
 VIEW_NOTE = ("SaXML export: tables with View limited by False are used by table occurrences in other files. "
-             "Save a Copy as XML leaves out table occurrences whose table the account cannot access at all; "
-             "limited by False keeps them in the export while showing no record. Don't set these tables to no access.")
+             "Save a Copy as XML leaves out table occurrences whose table the account cannot access at all, and writes "
+             "fields it cannot access as <No Access> in calculations. View limited by False with field access on keeps "
+             "both in the export while showing no record. Don't set these tables, or their fields, to no access.")
 JOB_FIELDS = {"xmlFile": "modifiable", "jobStatus": "viewOnly", "jobMessage": "viewOnly", "createTimestamp": "viewOnly"}
 
 def table_grant(s, table):
@@ -316,14 +317,27 @@ def privilege_plan(files, account):
         tables, scripts, layouts, notes = addon_grants(r, s) if installed else ([], [], [], [])
         named = {t["name"] for t in tables}
         for table, refs in sorted(needs.get(label, {}).items()):
-            if s.get("builtIn") or table_grant(s, table).get("view") in ("yes", "limited") or table in named:
+            g = table_grant(s, table)
+            if s.get("builtIn") or table in named:
+                continue
+            if g.get("view") == "limited" and g.get("viewCalculation", {}).get("text", "").strip() == "False" \
+                    and g.get("fields", {}).get("access") != "all":
+                # no record passes False, so field access all exposes nothing; 0.2.4 wrote none here
+                tables.append({"name": table, "fields": {"access": "all"}})
+                say.append("  table %-26s field access all (View is limited by False; field access none breaks calculation text)" % table)
+                continue
+            if g.get("view") in ("yes", "limited"):
+                if g.get("fields", {}).get("access") != "all":
+                    # Changing this would widen what the account reads (View yes) or need a judgment call, so say it.
+                    notes.append("%s: field access is %s, so other files' calculations show its fields as <No Access> in the SaXML; "
+                                 "give the export account field access all on it" % (table, g.get("fields", {}).get("access", "none")))
                 continue
             to = next((o["name"] for o in r["tos"] if not o.get("table", {}).get("dataSource") and o.get("table", {}).get("name") == table), None)
             if to is None:
                 notes.append("no table occurrence of %s in this file to write the View calculation against; add one" % table)
                 continue
             tables.append({"name": table, "view": "limited", "viewCalculation": {"tableOccurrence": to, "text": "False"},
-                           "edit": "no", "create": "no", "delete": "no", "fields": {"access": "none"}})
+                           "edit": "no", "create": "no", "delete": "no", "fields": {"access": "all"}})
             say.append("  table %-26s View limited by False (used by %s%s)" % (table, ", ".join(refs[:3]), ", ..." if len(refs) > 3 else ""))
         for t in tables:
             if t["name"] == TABLE:

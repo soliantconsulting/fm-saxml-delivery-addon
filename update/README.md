@@ -31,6 +31,6 @@ If every file uses the same [Full Access] account and password, add `--credentia
 In the export account's privilege set, only where it lacks them:
 
 - In a file with the add-on: View and Edit on `SaXMLDelivery` records, view only on its job fields and modifiable on `xmlFile`, executable only on `saxmlDelivery_createXml` and `saxmlDelivery_getVersion`, and records modifiable through the `SaXMLDeliveryExecutionContext` layout.
-- In every file: View limited by the calculation `False` on each base table that another file's table occurrences use. Without it the SaXML of the other file silently leaves those table occurrences out; with `False` the account still sees no record. See "Multi-file solutions" in the main README.
+- In every file: View limited by the calculation `False`, with field access all, on each base table that another file's table occurrences use. Without it the SaXML of the other file silently leaves those table occurrences out; with `False` the account still sees no record. See "Multi-file solutions" in the main README.
 
 It never lowers a grant. After the apply it reads every file again and reports anything still missing. It does not add the `fmrest` extended privilege or create a missing account; it names them for you to fix by hand.
