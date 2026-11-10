@@ -93,7 +93,7 @@ const GROUPS = [
   { name: "Privilege Set", tasks: [
     ["Change", "Data API account's set: view access to <code>jobStatus</code> and <code>jobMessage</code>", "Only if the set limits the SaXMLDelivery fields one by one. Without it, polling can't read the status.", 5],
     ["Change", "Data API account's set: Executable only for <code>saxmlDelivery_getVersion</code>", "Only if the set limits scripts.", 3],
-    ["Change", "Data API account's set, in every file of the solution: View on records of base tables that other files' table occurrences use", "Edit, Create and Delete no, field access none. Without it the SaXML silently drops those table occurrences. The account must exist in each file. This lets the account read those records, so decide first.", 10],
+    ["Change", "Data API account's set, in every file of the solution: View limited by <code>False</code> on base tables that other files' table occurrences use", "Records &rarr; Custom privileges: View = limited, calculation <code>False</code>; Edit, Create and Delete no; field access none. Without it the SaXML silently drops those table occurrences, and with <code>False</code> no record is visible. The account must exist in each file.", 10],
   ]},
   { name: "Post-Deployment", tasks: [
     ["Check", "No <code>&lt;Field Missing&gt;</code> or <code>&lt;unknown&gt;</code> in the pasted scripts", "Search both replaced scripts and the new one.", 3],
