@@ -55,6 +55,8 @@ So in every file the solution uses:
 
 With 'limited' and `False` the table counts as accessible, so its table occurrences stay in the SaXML, but the account can see no record of it. Plain View (yes) also works, but lets the account read those records if it is ever given a layout on them. A file that only references others, and is referenced by none, needs no extra table access.
 
+The update script in `update/` finds these tables and sets them for you: give it every file of the solution with `--export-account=<the pipeline's account>`, and `--grant-privileges` to apply.
+
 Per server:
 
 - Install a valid SSL certificate (required by the Data API)
@@ -84,6 +86,6 @@ The ```saxmlDelivery_createXml``` script is asynchronous when the file is hosted
 
 ## Upgrade Instructions
 
-- Run the update script in `update/` (see its README). It updates installed files in place from any earlier version, without removing anything.
+- Run the update script in `update/` (see its README). It updates installed files in place from any earlier version, without removing anything. With `--export-account` it also sets the pipeline account's privileges.
 - Or, uninstall the add-on and install the new one
   - This will remove and re-add the table, layout, and scripts, which breaks any references to them

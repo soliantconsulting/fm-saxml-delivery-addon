@@ -1,26 +1,11 @@
 # Update the SaXML delivery add-on in installed files
 
-Instructions for Claude Code (or another AI agent with the ADK `filemaker` command). Use them to update installed copies of the add-on to the latest version, from whatever version each is on, including the privilege sets the pipeline's account uses.
+Instructions for Claude Code (or another AI agent with the ADK `filemaker` command). Use them to update installed copies of the add-on to the latest version, from whatever version each is on, including the privileges of the account the pipeline uses.
 
-Needs an account on [Full Access] in each file. Never delete and re-create anything: update scripts, fields, layouts and privilege sets in place so references to them keep working.
+Needs an account on [Full Access] in each file. Never delete and re-create anything.
 
-## 1. Schema and scripts
-
-1. Ask which files to update and the account name. Never ask for a password; the script uses the keychain, or shows a window that asks the user.
-2. Run a dry run and show the plan to the user: `update/update-saxml-addon.sh --username=<account> [--host=<host>] <file>,<file>`
-3. After the user confirms (and has backed the files up and closed Manage Database and the script editor), run it again with `--apply`. It reports "updated and verified" per file.
-
-## 2. Privilege sets
-
-The script does not touch privilege sets, because the one the pipeline uses has no fixed name. For each updated file:
-
-1. Find the account the pipeline logs in with. Ask the user for its name; if they don't know, look for accounts that have the `fmrest` extended privilege (`filemaker help account read`) and ask which one it is. Never guess.
-2. Read that account's privilege set (`filemaker help privilegeSet read`, with `"detail":true`) and use only that set. Most custom sets can execute `saxmlDelivery_createXml`, so executing it does not identify the pipeline's set.
-3. Check what that set grants, and propose only what is missing:
-   - Fields of the `SaXMLDelivery` table. If the set grants all fields, nothing is needed. If it lists fields individually, `jobStatus` and `jobMessage` need view only.
-   - The script `saxmlDelivery_getVersion`, which clients use to read the add-on version without starting an export. A set gets it from its entry for that script, or else from its grant for scripts without an entry (`newScripts` in the read). If that is `noAccess`, the script needs executable only (`scripts: [{"name":"saxmlDelivery_getVersion","access":"executableOnly"}]`). A set that grants all scripts needs nothing.
-   - Record access to base tables that table occurrences in other files are based on (see "Multi-file solutions" in the README). Read the table occurrences of every file in the solution (`filemaker help tableOccurrence read`) and collect the base tables that other files' table occurrences point to in this file. Each needs View `limited` with the calculation `False` (in the op: `"view":"limited","viewCalculation":{"tableOccurrence":"<a TO of that table>","text":"False"}`); Edit, Create and Delete stay no, and field access stays none. A table whose View is already yes or limited needs nothing. Without it the SaXML of the referring file leaves those table occurrences out, with no error. This changes access to tables outside the add-on, so list these grants apart from the others and apply them only if the user explicitly says yes to them.
-   - Do not widen any other grant.
-4. Show the plan per set. After the user confirms, run `update:privilegeSet` with only the grants that are missing (`filemaker help privilegeSet update`), then read the set back in a fresh process and check each grant: the fields, the script's effective access as in step 3, and the View setting on the referenced base tables.
-
-Report what was updated per file, what was already current, and anything skipped.
+1. Ask which solution to update: every file in it, the host, the [Full Access] account name, and the export account (the account the pipeline calls the add-on with, `FM_USERNAME` in its pipeline). Never ask for a password; the script uses the keychain, or shows a window that asks the user. If the user doesn't know the export account, look for accounts with the `fmrest` extended privilege (`filemaker help account read`) and ask which one it is. Never guess.
+2. Run a dry run and show the plan to the user: `update/update-saxml-addon.sh --username=<account> --host=<host> --export-account=<export account> <file>,<file>,...`. List every file of the solution, so the script can find the base tables that other files' table occurrences use.
+3. Point out the grants of View limited by `False` on tables outside the add-on separately: they change access to the solution's own tables, although no record becomes visible. Ask whether to apply them.
+4. After the user confirms (and has backed the files up and closed Manage Database and the script editor), run it again with `--apply`, plus `--grant-privileges` if the user said yes to the grants. It reports "updated and verified" or "privileges applied" per file, and checks the privileges again at the end.
+5. Report what was updated per file, what was already current, and every PROBLEM, NOTE and WARNING line it printed (a missing account, a missing `fmrest`, a file of the solution that wasn't in the run).

@@ -1,28 +1,37 @@
 #!/usr/bin/env bash
 # Brings an installed copy of the SaXML delivery add-on up to date, whatever version it is on.
 # The latest definitions are read from src/SaXMLDelivery.fmp12 in this repo. See README.md.
-#   update-saxml-addon.sh --username=<account> [--host=<host>] [--apply] <file>,<file>,...
+#   update-saxml-addon.sh --username=<account> [--host=<host>] [--export-account=<name> [--grant-privileges]] [--apply] <file>,<file>,...
 # A <file> is a name on --host, or a full path or fmnet:// address. Separate files with commas.
 # Without --apply it only does a dry run and changes nothing.
+# --export-account names the account the pipeline calls the add-on with. The script then also plans that account's
+# privileges in every file given, so list every file of the solution. --grant-privileges, with --apply, applies them.
 #
 # It compares each installed file with the source and, for what differs:
 #   - creates missing fields
 #   - replaces the layout's objects with the latest ones (the layout is not meant to be customized)
 #   - creates missing scripts
 #   - replaces the body of existing scripts in place (script ids and names stay, so references keep working)
-# It never deletes anything. It does not touch privilege sets; see update-saxml-addon.prompt.md.
+# With --export-account it also plans, and with --grant-privileges sets, the export account's privilege set in each file:
+#   - in a file with the add-on: View and Edit on SaXMLDelivery, its job fields, the two scripts, and records
+#     modifiable on its layout
+#   - in every file: View limited by False on each base table that table occurrences in the other files use, so the
+#     SaXML keeps those table occurrences while the account sees no record
+# It only ever adds access, and never deletes anything.
 set -uo pipefail
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=${SOURCE:-$HERE/../src/SaXMLDelivery.fmp12}
 SOURCE_USER=${SOURCE_USER:-Admin}
 
-USERNAME="" HOST="" APPLY=0 TARGETS=()
+USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 TARGETS=()
 for a in "$@"; do
   case $a in
     --username=*) USERNAME=${a#*=} ;;
     --host=*) HOST=${a#*=} ;;
     --apply) APPLY=1 ;;
+    --export-account=*) EXPORT=${a#*=} ;;
+    --grant-privileges) GRANT=1 ;;
     --*) echo "unknown option: $a" >&2; exit 64 ;;
     *) IFS=, read -ra parts <<< "$a"
        for p in "${parts[@]}"; do
@@ -32,6 +41,7 @@ for a in "$@"; do
   esac
 done
 [ -n "$USERNAME" ] && [ ${#TARGETS[@]} -gt 0 ] || { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+[ $GRANT -eq 0 ] || [ -n "$EXPORT" ] || { echo "--grant-privileges needs --export-account=<name>" >&2; exit 64; }
 for t in "${TARGETS[@]}"; do
   [[ $t == */* || -n $HOST ]] || { echo "$t is a bare name; give --host=<host> or a full path" >&2; exit 64; }
 done
@@ -71,8 +81,9 @@ def reads(path):
         e = fatal[0]["error"]
         raise SystemExit("ERROR %s (dbError %s): %s" % (e.get("code"), e.get("dbError"), e.get("message", "")[:200]))
     ops = [o for o in lines(path) if "op" in o]
-    if len(ops) != len(SCRIPTS) + 3:
+    if len(ops) != len(SCRIPTS) + 6:
         raise SystemExit("ERROR no read result (did the file open?)")
+    ops, extra = ops[:len(SCRIPTS) + 3], ops[len(SCRIPTS) + 3:]
     res = {"scripts": {}}
     for name, o in zip(SCRIPTS, ops):
         if o["status"] == "ok":
@@ -85,6 +96,7 @@ def reads(path):
     res["fields"] = {i["name"]: i for i in f["result"]["items"]} if f["status"] == "ok" else {}
     res["layout"] = l["result"] if l["status"] == "ok" else None
     res["privsets"] = p["result"]["items"] if p["status"] == "ok" else []
+    res["tos"], res["sources"], res["accounts"] = [o["result"]["items"] if o["status"] == "ok" else [] for o in extra]
     return res
 
 def norm(body):
@@ -181,6 +193,8 @@ def privilege_sets_needing_grant(r):
               scripts, or gives new scripts access, covers it already."""
     out = []
     for s in r["privsets"]:
+        if s.get("builtIn"):
+            continue
         what = []
         for t in s.get("records", {}).get("tables", []):
             if t["name"] != TABLE or t.get("fields", {}).get("access") != "limited":
@@ -194,6 +208,137 @@ def privilege_sets_needing_grant(r):
         if what:
             out.append("%s (%s)" % (s["name"], ", ".join(what)))
     return out
+
+# --- Privileges of the export account (the account the pipeline calls the add-on with over the Data API) ---
+# Built-in sets other than [Read-Only Access] grant everything the export needs.
+JOB_FIELDS = {"xmlFile": "modifiable", "jobStatus": "viewOnly", "jobMessage": "viewOnly", "createTimestamp": "viewOnly"}
+
+def table_grant(s, table):
+    """A set's record access to a table: its own entry, else the grant for tables without one."""
+    recs = s.get("records", {})
+    for t in recs.get("tables", []):
+        if t["name"] == table:
+            return t
+    return recs.get("newTables", {})
+
+def layout_grant(s, name):
+    lays = s.get("layouts", {})
+    for l in lays.get("layouts", []):
+        if l.get("name") == name:
+            return l
+    return lays.get("newLayouts", {})
+
+def file_label(path):
+    """FileA from fmnet://host/FileA, /a/b/FileA.fmp12, file:FileA.fmp12 or fmnet:/host/FileA."""
+    base = path.split(":", 1)[-1].rstrip("/").split("/")[-1]
+    return base[:-6] if base.lower().endswith(".fmp12") else base
+
+def export_set(r, account):
+    """(privilege set describe, None) or (None, problem)."""
+    acct = next((a for a in r["accounts"] if a["name"].lower() == account.lower()), None)
+    if acct is None:
+        return None, "account %s does not exist in this file" % account
+    s = next((p for p in r["privsets"] if p["name"] == acct["privilegeSet"]), None)
+    if s is None:
+        return None, "cannot read privilege set %s" % acct["privilegeSet"]
+    return s, None
+
+def addon_grants(r, s):
+    """What the export account needs in a file that has the add-on, as (records tables, scripts, layouts, notes)."""
+    tables, scripts, layouts, notes = [], [], [], []
+    if s.get("builtIn"):
+        if s["name"] == "[Read-Only Access]":
+            notes.append("set [Read-Only Access] cannot clear xmlFile after the download; give the account a custom set")
+        return tables, scripts, layouts, notes
+    g = table_grant(s, TABLE)
+    entry = {}
+    if g.get("view") != "yes" or g.get("edit") != "yes":
+        entry.update({"view": "yes", "edit": "yes"})
+    f = g.get("fields", {})
+    if f.get("access") != "all":
+        have = {x["name"]: x.get("access") for x in f.get("fields", [])}
+        rank = {"noAccess": 0, "viewOnly": 1, "modifiable": 2}
+        add = [{"name": n, "access": a} for n, a in JOB_FIELDS.items()
+               if rank.get(have.get(n, f.get("newFields", {}).get("access", "noAccess")), 0) < rank[a]]
+        if add:
+            entry["fields"] = {"fields": add}
+    if entry:
+        entry["name"] = TABLE
+        tables.append(entry)
+    for n in ("saxmlDelivery_createXml", "saxmlDelivery_getVersion"):
+        if r["scripts"].get(n) is not None and script_access(s, n) in (None, "noAccess"):
+            scripts.append({"name": n, "access": "executableOnly"})
+    l = layout_grant(s, LAYOUT)
+    if l.get("access") in (None, "noAccess") or l.get("records") != "modifiable":
+        layouts.append({"name": LAYOUT, "access": l["access"] if l.get("access") not in (None, "noAccess") else "viewOnly",
+                        "records": "modifiable"})
+    if "fmrest" not in s.get("extendedPrivileges", []):
+        notes.append("set %s lacks the fmrest extended privilege; add it by hand if the Data API account uses it" % s["name"])
+    return tables, scripts, layouts, notes
+
+def cross_file_needs(files):
+    """{label: {table: [referring 'File::TO', ...]}} for base tables that other files' TOs use, plus warnings."""
+    labels = {l.lower(): l for l in files}
+    needs, warns = {}, []
+    for a, r in files.items():
+        paths = {d["name"]: d.get("paths", []) for d in r["sources"]}
+        for to in r["tos"]:
+            t = to.get("table", {})
+            ds = t.get("dataSource")
+            if not ds or ds not in paths:
+                continue  # local, or ODBC
+            b = next((labels[file_label(p).lower()] for p in paths[ds] if file_label(p).lower() in labels), None)
+            if b is None:
+                warns.append("%s::%s uses data source %s (%s), which is not in this run; add that file" % (a, to["name"], ds, ", ".join(paths[ds])))
+            elif not t.get("resolved") or "name" not in t:
+                warns.append("%s::%s: its base table in %s could not be resolved" % (a, to["name"], b))
+            else:
+                needs.setdefault(b, {}).setdefault(t["name"], []).append("%s::%s" % (a, to["name"]))
+    return needs, warns
+
+def privilege_plan(files, account):
+    """{label: (update:privilegeSet op or None, [plan lines])} for the export account in every file."""
+    needs, warns = cross_file_needs(files)
+    out = {}
+    for label, r in files.items():
+        say = []
+        s, problem = export_set(r, account)
+        if problem:
+            out[label] = (None, ["  PROBLEM " + problem])
+            continue
+        installed = any(v is not None for v in r["scripts"].values())
+        tables, scripts, layouts, notes = addon_grants(r, s) if installed else ([], [], [], [])
+        named = {t["name"] for t in tables}
+        for table, refs in sorted(needs.get(label, {}).items()):
+            if s.get("builtIn") or table_grant(s, table).get("view") in ("yes", "limited") or table in named:
+                continue
+            to = next((o["name"] for o in r["tos"] if not o.get("table", {}).get("dataSource") and o.get("table", {}).get("name") == table), None)
+            if to is None:
+                notes.append("no table occurrence of %s in this file to write the View calculation against; add one" % table)
+                continue
+            tables.append({"name": table, "view": "limited", "viewCalculation": {"tableOccurrence": to, "text": "False"},
+                           "edit": "no", "create": "no", "delete": "no", "fields": {"access": "none"}})
+            say.append("  table %-26s View limited by False (used by %s%s)" % (table, ", ".join(refs[:3]), ", ..." if len(refs) > 3 else ""))
+        for t in tables:
+            if t["name"] == TABLE:
+                say.append("  table %-26s %s" % (TABLE, ", ".join(filter(None, [
+                    "View and Edit yes" if "view" in t else "",
+                    "fields " + ", ".join("%s %s" % (f["name"], f["access"]) for f in t.get("fields", {}).get("fields", [])) if "fields" in t else ""]))))
+        for x in scripts:
+            say.append("  script %-25s executable only" % x["name"])
+        for x in layouts:
+            say.append("  layout %-25s %s, records modifiable" % (x["name"], x["access"]))
+        op = None
+        if tables or scripts or layouts:
+            op = {"op": "update:privilegeSet", "name": s["name"]}
+            if tables: op["records"] = {"tables": tables}
+            if scripts: op["scripts"] = {"scripts": scripts}
+            if layouts: op["layouts"] = {"layouts": layouts}
+            say.insert(0, "  privilege set %s (account %s):" % (s["name"], account))
+        else:
+            say.insert(0, "  privilege set %s (account %s): nothing needed" % (s["name"], account))
+        out[label] = (op, say + ["  NOTE " + n for n in notes])
+    return out, warns
 
 def plan(src, tgt, say=print):
     """The creates and the script updates that bring tgt up to the source, printing a line per element."""
@@ -242,16 +387,18 @@ elif cmd == "plan":
     open(sys.argv[5], "w").write("".join(json.dumps(o, ensure_ascii=False) + "\n" for o in updates))
     print("NOTHING-TO-DO" if not creates and not updates else "CHANGES")
 elif cmd == "session":
-    # session <source.txt> <read.ndjson> <creates> <updates> <out> <filemaker args...>
-    # Applies the creates and the script updates in one filemaker run, so the file is opened once and the whole
-    # update commits or rolls back as one batch. filemaker answers each op as it arrives on stdin, so after the
-    # creates the file is read again in the same run: creating invalidates the update ops' tokens, and the
-    # updates are planned again from that read.
+    # session <source.txt> <read.ndjson> <creates> <updates> <privileges> <out> <filemaker args...>
+    # Applies the creates, the script updates and the privilege grants in one filemaker run, so the file is opened
+    # once and the whole update commits or rolls back as one batch. filemaker answers each op as it arrives on
+    # stdin, so after the creates the file is read again in the same run: creating invalidates the update ops'
+    # tokens, and the updates are planned again from that read.
     import subprocess
     src = reads(sys.argv[2])
     read_ops = [l for l in open(sys.argv[3]) if l.strip()]
     creates = [l for l in open(sys.argv[4]) if l.strip()]
     updates = [l for l in open(sys.argv[5]) if l.strip()]
+    grants = [l for l in open(sys.argv[6]) if l.strip()]
+    sys.argv[6:7] = []
     out = open(sys.argv[6], "w")
     err = open(sys.argv[6] + ".err", "w+")  # a file, not a pipe, so a full stderr pipe cannot stall the run
     p = subprocess.Popen(["filemaker"] + sys.argv[7:], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -280,6 +427,8 @@ elif cmd == "session":
                 updates = [json.dumps(o, ensure_ascii=False) for o in updates]
     if ok and updates:
         _, ok = send(updates)
+    if ok and grants:
+        _, ok = send(grants)
     p.stdin.close()
     out.write(p.stdout.read())
     rc = p.wait()
@@ -297,6 +446,22 @@ elif cmd == "checksource":
     if not ok:
         print("saxmlDelivery_getVersion says %s but saxmlDelivery_createXml says %s; fix the source file first" % (a, b))
         sys.exit(1)
+elif cmd == "privplan":
+    # privplan <account> <list.tsv>: rows of index, label, read file. Writes p<index>.ndjson next to each read,
+    # prints the plan per file, and exits 1 when any file still needs a grant (used to verify after the apply).
+    rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[3]) if l.strip()]
+    files = {lab: reads(path) for _, lab, path in rows}
+    plans, warns = privilege_plan(files, sys.argv[2])
+    pending = False
+    for i, lab, path in rows:
+        op, say = plans[lab]
+        print(lab)
+        print("\n".join(say))
+        pending |= op is not None
+        open(path.rsplit("/", 1)[0] + "/p%s.ndjson" % i, "w").write(json.dumps(op, ensure_ascii=False) + "\n" if op else "")
+    for w in warns:
+        print("  WARNING " + w)
+    sys.exit(10 if pending else 0)
 elif cmd == "privneeds":
     print(", ".join(privilege_sets_needing_grant(reads(sys.argv[2]))))
 elif cmd == "errors":
@@ -357,11 +522,11 @@ run() { # run <file> <ndjson> [--dry-run] -> output in $TMP/out.txt
   kind=read
   timed "$kind" "$f" "$ops" filemaker "--file=$f" "--username=$USERNAME" --keychain --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
 }
-session() { # session <i> <file> [--dry-run]: the creates and updates for file i in one filemaker run -> $TMP/out.txt
+session() { # session <i> <file> [--dry-run]: the creates, updates and grants for file i in one filemaker run -> $TMP/out.txt
   local i=$1 f=$2 kind=apply; shift 2
   [ "${1:-}" = --dry-run ] && kind=dryrun
-  cat "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/cu$i.ndjson"  # only to count the ops for the timing
-  timed "$kind" "$f" "$TMP/cu$i.ndjson" H session "$TMP/source.txt" "$TMP/read.ndjson" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/out.txt" \
+  cat "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/p$i.ndjson" > "$TMP/cu$i.ndjson"  # only to count the ops for the timing
+  timed "$kind" "$f" "$TMP/cu$i.ndjson" H session "$TMP/source.txt" "$TMP/read.ndjson" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/p$i.ndjson" "$TMP/out.txt" \
     "--file=$f" "--username=$USERNAME" --keychain --prompt "$@"
 }
 hosted() { # a bare name goes to --host, without .fmp12; a path or fmnet:// address is used as given
@@ -378,7 +543,10 @@ cat > "$TMP/read.ndjson" <<'E'
 {"op":"read:script","name":"saxmlDelivery_getVersion"}
 {"op":"read:field","table":"SaXMLDelivery","detail":true}
 {"op":"read:layout","name":"SaXMLDeliveryExecutionContext","detail":true}
-{"op":"read:privilegeSet","detail":true,"filter":{"builtIn":false}}
+{"op":"read:privilegeSet","detail":true}
+{"op":"read:tableOccurrence"}
+{"op":"read:externalDataSource","detail":true}
+{"op":"read:account","detail":true}
 E
 
 echo "Reading the latest definitions from $(basename "$SOURCE")"
@@ -388,7 +556,7 @@ H plan "$TMP/source.txt" "$TMP/source.txt" /dev/null /dev/null >/dev/null 2>"$TM
 H checksource "$TMP/source.txt" || exit 1
 echo "Latest version: $(H version "$TMP/source.txt")"
 
-declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=() PRE023=()
+declare -a OK_TARGETS=() REPORT=() REACHABLE=() UPDATED=() NEEDS=() PRE023=() PSKIP=()
 
 # 0.2.3 changed no schema; it marks files whose pipeline account may lack record access in other files.
 below_023() { [ -n "$1" ] && [ "$1" != 0.2.3 ] && [ "$(printf '%s\n' "$1" 0.2.3 | sort -V | head -1)" = "$1" ]; }
@@ -396,8 +564,8 @@ multifile_note() {
   [ ${#PRE023[@]} -gt 0 ] || return 0
   echo; echo "Check the pipeline account's record access in ${PRE023[*]} and every file their solution uses (see \"Multi-file solutions\" in README.md):"
   echo "  FileMaker opens other files with that account's own privilege set, even though the export runs with full access. Where it cannot"
-  echo "  access a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. View limited by False fixes it without showing any record. This script"
-  echo "  does not change privilege sets; section 2 of update/update-saxml-addon.prompt.md checks them."
+  echo "  access a base table's records, the SaXML silently leaves out every table occurrence in other files based on that table. View limited by False fixes it without showing any record."
+  echo "  Run again with every file of the solution and --export-account=<the pipeline's account> to check and set it."
 }
 
 # Phase 0: read every file, which also asks for every password up front. FileMaker offers to keep
@@ -418,55 +586,90 @@ done
 [ ${#REACHABLE[@]} -gt 0 ] || { echo; echo "No file could be opened."; printf '  %s\n' "${REPORT[@]}"; exit 1; }
 if [ $APPLY -eq 1 ]; then echo; echo "== Plan (--apply: the update follows straight away)"; else echo; echo "== Dry run"; fi
 
+label() { local n=${1##*/}; echo "${n%.fmp12}"; }
+plist() { # plist <tsv> [<verify read prefix>]: index, file name, read file for every reachable file
+  local i=0 t r; : > "$1"
+  for t in "${REACHABLE[@]}"; do
+    i=$((i+1)); r="$TMP/r$i.txt"; [ -n "${2:-}" ] && [ -f "$TMP/$2$i.txt" ] && r="$TMP/$2$i.txt"
+    printf '%s\t%s\t%s\n' "$i" "$(label "$(hosted "$t")")" "$r" >> "$1"
+  done
+}
+
+# Privileges: planned across all files at once, because a file needs access for the table occurrences of the others.
+i=0; for t in "${REACHABLE[@]}"; do i=$((i+1)); : > "$TMP/p$i.ndjson"; done
+if [ -n "$EXPORT" ]; then
+  echo; echo "== Privileges of the export account $EXPORT"
+  plist "$TMP/files.tsv"
+  H privplan "$EXPORT" "$TMP/files.tsv"
+  rc=$?; [ $rc -eq 0 ] || [ $rc -eq 10 ] || { echo "could not plan the privileges" >&2; exit 1; }
+fi
+if [ $APPLY -eq 1 ]; then echo; echo "== Plan (--apply: the update follows straight away)"; else echo; echo "== Dry run"; fi
+
 # Phase 1: plan every file from its read. A dry run also asks the file to check the ops without writing.
 i=0
 for t in "${REACHABLE[@]}"; do
-  i=$((i+1)); f=$(hosted "$t")
+  i=$((i+1)); f=$(hosted "$t"); installed=1; schema=0
   echo "$t  ($f)"
-  if ! H plan "$TMP/source.txt" "$TMP/r$i.txt" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/plan.txt" 2>"$TMP/err.txt"; then
-    if grep -q NOT-INSTALLED "$TMP/plan.txt"; then
-      echo "  skipped: the add-on is not installed in this file"; REPORT+=("$t: skipped (add-on not installed)")
-    else
-      echo "  failed: $(cat "$TMP/err.txt")"; REPORT+=("$t: failed ($(cat "$TMP/err.txt"))")
-    fi
+  : > "$TMP/c$i.ndjson"; : > "$TMP/u$i.ndjson"
+  if H plan "$TMP/source.txt" "$TMP/r$i.txt" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" > "$TMP/plan.txt" 2>"$TMP/err.txt"; then
+    grep -v -E '^(CHANGES|NOTHING-TO-DO)$' "$TMP/plan.txt"
+    if grep -q CHANGES "$TMP/plan.txt"; then schema=1; below_023 "$(H version "$TMP/r$i.txt" 2>/dev/null)" && PRE023+=("$t"); fi
+  elif grep -q NOT-INSTALLED "$TMP/plan.txt"; then
+    installed=0; echo "  the add-on is not installed in this file"
+  else
+    echo "  failed: $(cat "$TMP/err.txt")"; REPORT+=("$t: failed ($(cat "$TMP/err.txt"))"); continue
+  fi
+  if [ -s "$TMP/p$i.ndjson" ]; then
+    echo "  privilege grants planned (see above)"
+    if [ $APPLY -eq 1 ] && [ $GRANT -eq 0 ]; then PSKIP+=("$t"); : > "$TMP/p$i.ndjson"; fi
+  fi
+  if [ $schema -eq 0 ] && [ ! -s "$TMP/p$i.ndjson" ]; then
+    if [ $installed -eq 1 ]; then REPORT+=("$t: already up to date"); else REPORT+=("$t: add-on not installed, nothing to grant"); fi
     continue
   fi
-  grep -v -E '^(CHANGES|NOTHING-TO-DO)$' "$TMP/plan.txt"
-  if grep -q NOTHING-TO-DO "$TMP/plan.txt"; then REPORT+=("$t: already up to date"); continue; fi
-  below_023 "$(H version "$TMP/r$i.txt" 2>/dev/null)" && PRE023+=("$t")
   if [ $APPLY -eq 0 ]; then
     session "$i" "$f" --dry-run
     if ! grep -q '"errors":0' "$TMP/out.txt"; then echo "  dry run refused:"; H errors "$TMP/out.txt"; REPORT+=("$t: failed dry run"); continue; fi
     REPORT+=("$t: would be updated")
   fi
-  OK_TARGETS+=("$i|$t|$f")
+  OK_TARGETS+=("$i|$t|$f|$installed")
 done
 
+skipped_note() {
+  [ ${#PSKIP[@]} -gt 0 ] || return 0
+  echo; echo "Privilege grants were planned but not applied in ${PSKIP[*]}. Rerun with --grant-privileges to apply them."
+}
+
 if [ ${#OK_TARGETS[@]} -eq 0 ]; then
-  echo; echo "Nothing to apply."; printf '  %s\n' "${REPORT[@]}"; exit 0
+  echo; echo "Nothing to apply."; printf '  %s\n' "${REPORT[@]}"; skipped_note; exit 0
 fi
 
 if [ $APPLY -eq 0 ]; then
   echo; echo "== Summary (dry run)"; printf '  %s\n' "${REPORT[@]}"
-  multifile_note
-  echo; echo "Dry run only: nothing was changed. Back the files up, close Manage Database and the script editor in each, then run again with --apply to update ${#OK_TARGETS[@]} file(s)."
+  [ -n "$EXPORT" ] || multifile_note
+  echo; echo "Dry run only: nothing was changed. Back the files up, close Manage Database and the script editor in each, then run again with --apply${EXPORT:+ (and --grant-privileges for the privilege grants)} to update ${#OK_TARGETS[@]} file(s)."
   exit 0
 fi
 
-# Phase 2: apply each file in one run (creates, a fresh read, then script updates), then verify from a new read.
+# Phase 2: apply each file in one run (creates, a fresh read, script updates, grants), then verify from a new read.
 echo; echo "== Apply"
 for entry in "${OK_TARGETS[@]}"; do
-  IFS='|' read -r i t f <<< "$entry"
+  IFS='|' read -r i t f installed <<< "$entry"
   echo "$t"
   failed=0
   session "$i" "$f"
   grep -q '"errors":0' "$TMP/out.txt" && grep -q '"rolledBack":false' "$TMP/out.txt" || { failed=1; H errors "$TMP/out.txt"; }
   if [ $failed -eq 0 ]; then
-    run "$f" "$TMP/read.ndjson"
-    v=$(H verify "$TMP/source.txt" "$TMP/out.txt" 2>&1) && { echo "  updated and verified"; REPORT+=("$t: updated and verified"); UPDATED+=("$t")
-                     sets=$(H privneeds "$TMP/out.txt" 2>/dev/null)
-                     if [ -n "$sets" ]; then NEEDS+=("$t ($sets)"); fi; } \
-      || { echo "  verify failed: $v"; REPORT+=("$t: applied but verify failed ($v)"); }
+    run "$f" "$TMP/read.ndjson"; cp "$TMP/out.txt" "$TMP/v$i.txt"
+    if [ "$installed" = 0 ]; then
+      echo "  privileges applied"; REPORT+=("$t: privileges applied"); UPDATED+=("$t")
+    elif v=$(H verify "$TMP/source.txt" "$TMP/out.txt" 2>&1); then
+      echo "  updated and verified"; REPORT+=("$t: updated and verified"); UPDATED+=("$t")
+      sets=$(H privneeds "$TMP/out.txt" 2>/dev/null)
+      if [ -n "$sets" ]; then NEEDS+=("$t ($sets)"); fi
+    else
+      echo "  verify failed: $v"; REPORT+=("$t: applied but verify failed ($v)")
+    fi
   else
     echo "  failed (see above); this file may need a rerun. A lock error (303, 3313, 3315) means someone has Manage Database or the script editor open."
     REPORT+=("$t: failed")
@@ -474,12 +677,18 @@ for entry in "${OK_TARGETS[@]}"; do
 done
 
 echo; echo "== Summary"; printf '  %s\n' "${REPORT[@]}"
-if [ ${#NEEDS[@]} -gt 0 ]; then
+if [ -n "$EXPORT" ] && [ $GRANT -eq 1 ]; then
+  echo; echo "== Privileges after the update"
+  plist "$TMP/files2.tsv" v
+  if H privplan "$EXPORT" "$TMP/files2.tsv" > "$TMP/pcheck.txt"; then
+    echo "  verified: the export account has everything it needs in every file"
+  else
+    grep -E 'PROBLEM|NOTE|WARNING|^  (table|script|layout|privilege set .*:$)' "$TMP/pcheck.txt" | grep -v 'nothing needed' | sed 's/^/  still missing: /'
+  fi
+elif [ ${#NEEDS[@]} -gt 0 ]; then
   echo; echo "These files have privilege sets that lack access to something the add-on added. fields: no access to jobStatus or jobMessage. script: cannot execute saxmlDelivery_getVersion."
   printf '  %s\n' "${NEEDS[@]}"
-  echo "If the account that calls the add-on over the Data API uses one of them, it needs view access to both fields (fields) and execute access to the script (script). To update them, give this prompt to Claude Code, started in this repo:"
-  echo
-  files=$(IFS=,; for n in "${NEEDS[@]}"; do echo "${n%% (*}"; done | paste -sd, -)
-  echo "  Follow update/update-saxml-addon.prompt.md, section 2 only, to update the privilege sets in $files${HOST:+ on $HOST}. The schema and scripts are already updated. Use the account $USERNAME."
+  echo "If the Data API account uses one of them, rerun with every file of the solution, --export-account=<that account> and --grant-privileges."
 fi
-multifile_note
+skipped_note
+[ -n "$EXPORT" ] || multifile_note
