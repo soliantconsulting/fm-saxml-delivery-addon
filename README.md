@@ -1,6 +1,6 @@
 # fm-saxml-delivery-addon
 
-Version 0.2.4
+Version 0.2.5
 
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
@@ -28,7 +28,7 @@ Per FileMaker database file:
   - Suggested name: 'SaXML Delivery'
   - Custom record privileges
     - ```SaXMLDelivery``` table: View + Edit + 'modifiable' for ```xmlFile``` field; 'read only' for ```jobStatus``` and ```jobMessage``` ('no access' for all other fields)
-    - Base tables that table occurrences in other files are based on: View 'limited' with the calculation `False` (Edit, Create and Delete no; field access none). See [Multi-file solutions](#multi-file-solutions).
+    - Base tables that table occurrences in other files are based on: View 'limited' with the calculation `False` (Edit, Create and Delete no; field access all). See [Multi-file solutions](#multi-file-solutions).
     - All other tables: No access
   - Custom layout privileges
     - ```SaXMLDeliveryExecutionContext``` layout: View only (layout), Modifiable (records)
@@ -51,7 +51,7 @@ Per FileMaker database file:
 So in every file the solution uses:
 
 - The pipeline account must exist, with the same name and password, on a privilege set like the one above.
-- That set needs View set to 'limited', with the calculation `False`, on each base table that table occurrences in other files are based on. Edit, Create and Delete stay no, field access stays none, and it needs no layout access.
+- That set needs View set to 'limited', with the calculation `False`, on each base table that table occurrences in other files are based on. Edit, Create and Delete stay no, field access stays **all**, and it needs no layout access. Field access none or limited makes the SaXML write those fields as `<No Access>` in other files' calculations.
 
 With 'limited' and `False` the table counts as accessible, so its table occurrences stay in the SaXML, but the account can see no record of it. Plain View (yes) also works, but lets the account read those records if it is ever given a layout on them. A file that only references others, and is referenced by none, needs no extra table access.
 
