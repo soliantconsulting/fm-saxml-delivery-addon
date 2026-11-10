@@ -26,6 +26,8 @@ Then apply. `--grant-privileges` applies the privilege grants; leave it out to u
 
 If every file uses the same [Full Access] account and password, add `--credentials-from=fmnet://<host>/<one of the files>`. Every file then uses the password stored in the keychain for that one file, so you store it once instead of once per file.
 
+Hosted files are opened and worked on three at a time. `--jobs=<n>` changes that; lower it if a busy host answers some opens with error 802.
+
 ## What the privilege grants are
 
 In the export account's privilege set, only where it lacks them:

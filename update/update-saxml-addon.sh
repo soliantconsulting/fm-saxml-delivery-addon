@@ -8,6 +8,7 @@
 # privileges in every file given, so list every file of the solution. --grant-privileges, with --apply, applies them.
 # --credentials-from=<address> reads the keychain password stored for that file (spelled as --file is) for every
 # target, so files that share the account need one stored password instead of one each.
+# --jobs=<n> opens and works on at most n hosted files at once (default 3).
 #
 # It compares each installed file with the source and, for what differs:
 #   - creates missing fields
@@ -21,7 +22,7 @@
 #     SaXML keeps those table occurrences while the account sees no record
 # It only ever adds access, and never deletes anything.
 #
-# Hosted files are processed at the same time, each in one filemaker session from the first read to the commit.
+# Hosted files are processed --jobs at a time, each in one filemaker session from the first read to the commit.
 # Local files are processed one at a time, because a session locks the files its data sources point to.
 set -uo pipefail
 
@@ -29,7 +30,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=${SOURCE:-$HERE/../src/SaXMLDelivery.fmp12}
 SOURCE_USER=${SOURCE_USER:-Admin}
 
-USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 CREDS=() TARGETS=()
+USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 JOBS=3 CREDS=() TARGETS=()
 for a in "$@"; do
   case $a in
     --username=*) USERNAME=${a#*=} ;;
@@ -38,6 +39,7 @@ for a in "$@"; do
     --export-account=*) EXPORT=${a#*=} ;;
     --grant-privileges) GRANT=1 ;;
     --credentials-from=*) CREDS=("$a") ;;
+    --jobs=*) JOBS=${a#*=}; [[ $JOBS =~ ^[1-9][0-9]*$ ]] || { echo "--jobs needs a positive number" >&2; exit 64; } ;;
     --*) echo "unknown option: $a" >&2; exit 64 ;;
     *) IFS=, read -ra parts <<< "$a"
        for p in "${parts[@]}"; do
@@ -291,19 +293,26 @@ def cross_file_needs(files):
     labels = {l.lower(): l for l in files}
     needs, warns = {}, []
     for a, r in files.items():
-        paths = {d["name"]: d.get("paths", []) for d in r["sources"]}
+        paths = {d["name"]: d.get("paths", []) for d in r["sources"]
+                 if not d.get("dsn") and not all(p.lower().startswith("odbc:") for p in d.get("paths", []))}
+        unresolved = {}
         for to in r["tos"]:
             t = to.get("table", {})
             ds = t.get("dataSource")
             if not ds or ds not in paths:
                 continue  # local, or ODBC
             b = next((labels[file_label(p).lower()] for p in paths[ds] if file_label(p).lower() in labels), None)
-            if b is None:
-                warns.append("%s::%s uses data source %s (%s), which is not in this run; add that file" % (a, to["name"], ds, ", ".join(paths[ds])))
+            if b is None and any("$" in p for p in paths[ds]):
+                unresolved.setdefault(ds, []).append(to["name"])
+            elif b is None:
+                warns.append("WARNING %s::%s uses data source %s (%s), which is not in this run; add that file" % (a, to["name"], ds, ", ".join(paths[ds])))
             elif not t.get("resolved") or "name" not in t:
-                warns.append("%s::%s: its base table in %s could not be resolved" % (a, to["name"], b))
+                warns.append("WARNING %s::%s: its base table in %s could not be resolved" % (a, to["name"], b))
             else:
                 needs.setdefault(b, {}).setdefault(t["name"], []).append("%s::%s" % (a, to["name"]))
+        for ds, tos in unresolved.items():
+            warns.append("NOTE %s: data source %s (%s) is a variable, so the file its %d table occurrence(s) use can't be "
+                         "resolved here; check that file's privileges by hand" % (a, ds, ", ".join(paths[ds]), len(tos)))
     return needs, warns
 
 def privilege_plan(files, account):
@@ -426,8 +435,8 @@ elif cmd == "multi":
     # nothing is committed until every file has been verified; a file that fails rolls back on its own.
     import subprocess, threading, time
     from concurrent.futures import ThreadPoolExecutor
-    src_path, read_path, tmp, apply_, grant, export = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6] == "1", sys.argv[7]
-    rest = sys.argv[8:]
+    src_path, read_path, tmp, apply_, grant, export, jobs = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6] == "1", sys.argv[7], int(sys.argv[8])
+    rest = sys.argv[9:]
     i1 = rest.index("--"); i2 = rest.index("--", i1 + 1)
     targets = [t.split("|", 1) for t in rest[i1 + 1:i2]]
     fm_args = rest[i2 + 1:]
@@ -437,11 +446,16 @@ elif cmd == "multi":
     REASONS = {212: "login failed", 714: "account is not [Full Access]", 802: "no file by that name",
                803: "host not found or file in use", 303: "schema is locked by another session"}
 
+    last_start = [0.0]
+    start_lock = threading.Lock()
     class Session:
         def __init__(self, label, address):
             self.label, self.address, self.out = label, address, []
             self.start()
         def start(self):
+            with start_lock:  # starting many filemaker processes at the same instant can fail to start the network stack
+                time.sleep(max(0, last_start[0] + 1.5 - time.time()))
+                last_start[0] = time.time()
             self.raw, self.ok, self.ops = [], True, 0
             self.t0 = time.time()
             self.err = open("%s/%s.err" % (tmp, self.label), "w+")
@@ -520,11 +534,6 @@ elif cmd == "multi":
     # at a time, opened once to read and once to write.
     hold = all(addr.startswith("fmnet://") for _, addr in targets)
     sessions = []
-    if hold:
-        for n, (lab, addr) in enumerate(targets):
-            if n:
-                time.sleep(1.5)  # starting many filemaker processes at the same instant can fail to start the network stack
-            sessions.append(Session(lab, addr))
     reads_of = {}
     def open_error(s):
         for l in s.raw:
@@ -537,16 +546,19 @@ elif cmd == "multi":
         return None
     def first_read(s):
         # Opening several files at once sometimes fails for no lasting reason: FileMaker Server answers 802 (no such
-        # file), or the local network stack does not start (network_init_failed). Retry those; a refused login is not.
-        for attempt in range(4):
+        # file), or the local network stack does not start (network_init_failed). Retry those, backing off longer
+        # each time; a refused login is not retried.
+        if isinstance(s, tuple):
+            s = Session(*s); sessions.append(s)
+        for attempt in range(5):
             lines = s.send(read_ops, reads_only=True)
-            if s.ok or attempt == 3:
+            if s.ok or attempt == 4:
                 break
             s.close("read")
             if open_error(s) not in (802, "network_init_failed"):
                 s.closed = True
                 break
-            time.sleep(2 + 3 * attempt)
+            time.sleep((5, 10, 20, 40)[attempt])
             s.start()
         s.first = lines
         s.bad = {i for i, l in enumerate(lines) if json.loads(l).get("status") == "error"}
@@ -559,11 +571,13 @@ elif cmd == "multi":
                 s.ok = False; s.fail = str(e)
         else:
             s.ok = False
-    print("\n== Reading %d file(s)%s" % (len(targets), " at once" if hold else ""))
+    print("\n== Reading %d file(s)%s" % (len(targets), " %d at a time" % jobs if hold else ""))
     print("If a password window appears, enter the password there.")
     if hold:
-        with ThreadPoolExecutor(max_workers=len(sessions) or 1) as ex:
-            list(ex.map(first_read, sessions))
+        # at most `jobs` files open and read at once; each stays open afterwards, idle, until its commit
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
+            list(ex.map(first_read, [tuple(t) for t in targets]))
+        sessions.sort(key=lambda s: [l for l, _ in targets].index(s.label))
     else:
         for lab, addr in targets:
             s = Session(lab, addr); sessions.append(s)
@@ -597,7 +611,7 @@ elif cmd == "multi":
             print(s.label); print("\n".join(say))
             grants[s.label] = op
         for w in warns:
-            print("  WARNING " + w)
+            print("  " + w)
     print("\n== Plan (--apply: the update follows straight away)" if apply_ else "\n== Dry run")
 
     def reread(s, created):
@@ -671,7 +685,7 @@ elif cmd == "multi":
         return "changed", installed
 
     if hold:
-        with ThreadPoolExecutor(max_workers=len(live)) as ex:
+        with ThreadPoolExecutor(max_workers=jobs) as ex:
             results = list(ex.map(work, live))
         # commit (or end the dry run) for every file, then print each file's lines in the order given
         with ThreadPoolExecutor(max_workers=len(live)) as ex:
@@ -744,7 +758,8 @@ elif cmd == "multi":
                 for l in say[1:] if op is not None else [l for l in say if l.strip().startswith(("NOTE", "PROBLEM"))]:
                     print("  still missing: %s: %s" % (lab, l.strip()))
             for w in warns:
-                print("  still missing: WARNING " + w)
+                if w.startswith("WARNING"):
+                    print("  still missing: " + w)
     elif needs_sets:
         print("\nThese files have privilege sets that lack access to something the add-on added. fields: no access to jobStatus or jobMessage. script: cannot execute saxmlDelivery_getVersion.")
         print("\n".join("  " + n for n in needs_sets))
@@ -821,5 +836,5 @@ echo "Latest version: $(H version "$TMP/source.txt")"
 # Every file at once, one filemaker session each; see the multi command in the helper.
 ARGS=()
 for t in "${TARGETS[@]}"; do f=$(hosted "$t"); n=${f##*/}; ARGS+=("${n%.fmp12}|$f"); done
-H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" -- "${ARGS[@]}" -- \
+H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" "$JOBS" -- "${ARGS[@]}" -- \
   "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt
