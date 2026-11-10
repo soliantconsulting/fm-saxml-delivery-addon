@@ -211,6 +211,9 @@ def privilege_sets_needing_grant(r):
 
 # --- Privileges of the export account (the account the pipeline calls the add-on with over the Data API) ---
 # Built-in sets other than [Read-Only Access] grant everything the export needs.
+VIEW_NOTE = ("SaXML export: tables with View limited by False are used by table occurrences in other files. "
+             "Save a Copy as XML leaves out table occurrences whose table the account cannot access at all; "
+             "limited by False keeps them in the export while showing no record. Don't set these tables to no access.")
 JOB_FIELDS = {"xmlFile": "modifiable", "jobStatus": "viewOnly", "jobMessage": "viewOnly", "createTimestamp": "viewOnly"}
 
 def table_grant(s, table):
@@ -331,6 +334,10 @@ def privilege_plan(files, account):
         op = None
         if tables or scripts or layouts:
             op = {"op": "update:privilegeSet", "name": s["name"]}
+            desc = s.get("description") or ""
+            if any(t.get("viewCalculation", {}).get("text") == "False" for t in tables) and VIEW_NOTE not in desc:
+                op["description"] = (desc.rstrip() + ("" if desc.rstrip()[-1:] in ".!?" else ".") + " " if desc.strip() else "") + VIEW_NOTE
+                say.append("  description: adds a note on why some tables have View limited by False")
             if tables: op["records"] = {"tables": tables}
             if scripts: op["scripts"] = {"scripts": scripts}
             if layouts: op["layouts"] = {"layouts": layouts}
