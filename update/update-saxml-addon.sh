@@ -153,6 +153,8 @@ def layout_flat(layout):
     def f(o):
         o = json.loads(json.dumps(o))
         o.pop("id", None); o.pop("accessibilityLabel", None)
+        # a local style equal to the file's theme is dropped on write, so it never reads back the same in every theme
+        o.pop("localStyle", None)
         if o["type"] == "field":
             o["field"] = o["field"]["name"]
         if "objects" in o:
@@ -399,11 +401,16 @@ def plan(src, tgt, say=print):
         say("  layout %-26s REPLACE OBJECTS" % LAYOUT)
     else:
         say("  layout %-26s unchanged" % LAYOUT)
+    # new scripts go where the file keeps the add-on's existing ones, which need not be the source's folder
+    home = next((t for t in tgt["scripts"].values() if t is not None), None)
     for n in SCRIPTS:
         s, t = src["scripts"][n], tgt["scripts"][n]
         if t is None:
-            creates.append({"op": "create:script", "name": n, "folder": s["folder"], "hidden": s["hidden"],
-                            "runWithFullAccess": s["runWithFullAccess"], "body": s["body"]})
+            op = {"op": "create:script", "name": n, "hidden": s["hidden"], "runWithFullAccess": s["runWithFullAccess"], "body": s["body"]}
+            folder = home.get("folder") if home else s.get("folder")
+            if folder:
+                op["folder"] = folder
+            creates.append(op)
             say("  script %-26s CREATE (%d steps)" % (n, s["steps"]))
         else:
             d = differing(s["body"], t["body"])
@@ -443,7 +450,7 @@ elif cmd == "multi":
     src = reads(src_path)
     read_ops = [l.rstrip("\n") for l in open(read_path) if l.strip()]
     timing = open(tmp + "/timing.tsv", "a")
-    REASONS = {212: "login failed", 714: "account is not [Full Access]", 802: "no file by that name",
+    REASONS = {212: "login failed", 714: "account is not [Full Access]", 802: "no file by that name", 1638: "host is not allowing new connections",
                803: "host not found or file in use", 303: "schema is locked by another session"}
 
     last_start = [0.0]
@@ -544,22 +551,24 @@ elif cmd == "multi":
             if o.get("type") == "fatal":
                 return o["error"].get("dbError") or o["error"].get("code")
         return None
-    def first_read(s):
-        # Opening several files at once sometimes fails for no lasting reason: FileMaker Server answers 802 (no such
-        # file), or the local network stack does not start (network_init_failed). Retry those, backing off longer
-        # each time; a refused login is not retried.
-        if isinstance(s, tuple):
-            s = Session(*s); sessions.append(s)
+    def send_opening(s, ops):
+        # Opening a hosted file sometimes fails for no lasting reason: FileMaker Server answers 802 (no such file) or
+        # 1638 (not allowing new connections), or the local network stack does not start (network_init_failed).
+        # Retry those, backing off longer each time; a refused login is not retried.
         for attempt in range(5):
-            lines = s.send(read_ops, reads_only=True)
+            lines = s.send(ops, reads_only=True)
             if s.ok or attempt == 4:
-                break
+                return lines
             s.close("read")
-            if open_error(s) not in (802, "network_init_failed"):
+            if open_error(s) not in (802, 1638, "network_init_failed"):
                 s.closed = True
-                break
+                return lines
             time.sleep((5, 10, 20, 40)[attempt])
             s.start()
+    def first_read(s):
+        if isinstance(s, tuple):
+            s = Session(*s); sessions.append(s)
+        lines = send_opening(s, read_ops)
         s.first = lines
         s.bad = {i for i, l in enumerate(lines) if json.loads(l).get("status") == "error"}
         if s.ok and len(lines) == len(read_ops):
@@ -660,6 +669,7 @@ elif cmd == "multi":
                 s.close("read")  # its error results would roll the writes back; start clean
             s.start()
             s.opened = True
+            send_opening(s, [read_ops[-1]])  # opens the file, retrying a refused connection, before any write
         s.send(creates)
         if s.ok and creates:
             again = reread(s, creates)
