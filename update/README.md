@@ -24,6 +24,8 @@ Then apply. `--grant-privileges` applies the privilege grants; leave it out to u
 ./update-saxml-addon.sh --username=<full access account> --host=<host> --export-account=<export account> FileOne,FileTwo,FileThree --apply --grant-privileges
 ```
 
+If every file uses the same [Full Access] account and password, add `--credentials-from=fmnet://<host>/<one of the files>`. Every file then uses the password stored in the keychain for that one file, so you store it once instead of once per file.
+
 ## What the privilege grants are
 
 In the export account's privilege set, only where it lacks them:

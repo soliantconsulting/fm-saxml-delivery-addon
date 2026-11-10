@@ -6,6 +6,8 @@
 # Without --apply it only does a dry run and changes nothing.
 # --export-account names the account the pipeline calls the add-on with. The script then also plans that account's
 # privileges in every file given, so list every file of the solution. --grant-privileges, with --apply, applies them.
+# --credentials-from=<address> reads the keychain password stored for that file (spelled as --file is) for every
+# target, so files that share the account need one stored password instead of one each.
 #
 # It compares each installed file with the source and, for what differs:
 #   - creates missing fields
@@ -24,7 +26,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=${SOURCE:-$HERE/../src/SaXMLDelivery.fmp12}
 SOURCE_USER=${SOURCE_USER:-Admin}
 
-USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 TARGETS=()
+USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 CREDS=() TARGETS=()
 for a in "$@"; do
   case $a in
     --username=*) USERNAME=${a#*=} ;;
@@ -32,6 +34,7 @@ for a in "$@"; do
     --apply) APPLY=1 ;;
     --export-account=*) EXPORT=${a#*=} ;;
     --grant-privileges) GRANT=1 ;;
+    --credentials-from=*) CREDS=("$a") ;;
     --*) echo "unknown option: $a" >&2; exit 64 ;;
     *) IFS=, read -ra parts <<< "$a"
        for p in "${parts[@]}"; do
@@ -527,14 +530,14 @@ timed() { # timed <kind> <file> <ndjson> <command...>: runs the command and logs
 run() { # run <file> <ndjson> [--dry-run] -> output in $TMP/out.txt
   local f=$1 ops=$2 kind; shift 2
   kind=read
-  timed "$kind" "$f" "$ops" filemaker "--file=$f" "--username=$USERNAME" --keychain --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
+  timed "$kind" "$f" "$ops" filemaker "--file=$f" "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt "$@" "$ops" > "$TMP/out.txt" 2>&1
 }
 session() { # session <i> <file> [--dry-run]: the creates, updates and grants for file i in one filemaker run -> $TMP/out.txt
   local i=$1 f=$2 kind=apply; shift 2
   [ "${1:-}" = --dry-run ] && kind=dryrun
   cat "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/p$i.ndjson" > "$TMP/cu$i.ndjson"  # only to count the ops for the timing
   timed "$kind" "$f" "$TMP/cu$i.ndjson" H session "$TMP/source.txt" "$TMP/read.ndjson" "$TMP/c$i.ndjson" "$TMP/u$i.ndjson" "$TMP/p$i.ndjson" "$TMP/out.txt" \
-    "--file=$f" "--username=$USERNAME" --keychain --prompt "$@"
+    "--file=$f" "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt "$@"
 }
 hosted() { # a bare name goes to --host, without .fmp12; a path or fmnet:// address is used as given
   if [[ $1 != */* ]]; then
