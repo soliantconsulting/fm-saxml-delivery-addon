@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Brings an installed copy of the SaXML delivery add-on up to date, whatever version it is on.
+# Brings an installed copy of the SaXML delivery add-on up to date, whatever version it is on, or installs it (--install).
 # The latest definitions are read from src/SaXMLDelivery.fmp12 in this repo. See README.md.
-#   update-saxml-addon.sh --username=<account> [--host=<host>] [--credentials-from=<address>] [--export-account=<name>
+#   deploy-saxml-addon.sh --username=<account> [--host=<host>] [--credentials-from=<address>] [--export-account=<name>
 #     [--grant-privileges [--grant-field-access]]] [--install] [--jobs=<n>] [--apply] <file>,<file>,...
 # A <file> is a name on --host, or a full path or fmnet:// address. Separate files with commas.
 # Without --apply it only does a dry run and changes nothing.

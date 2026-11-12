@@ -1,6 +1,6 @@
-# Update the SaXMLDelivery add-on
+# Install or update the SaXMLDelivery add-on
 
-Brings installed copies of the add-on up to date from whatever version they are on, and, if you ask it to, gives the pipeline's account the privileges it needs. The latest definitions come from `src/SaXMLDelivery.fmp12` in this repo, so check out the tag of the release you want first.
+Brings installed copies of the add-on up to date from whatever version they are on, installs it with `--install` where it is missing, and, if you ask it to, gives the pipeline's account the privileges it needs. The latest definitions come from `src/SaXMLDelivery.fmp12` in this repo, so check out the tag of the release you want first.
 
 For each file it creates missing fields and puts them on the layout, creates missing scripts, and replaces the body of existing scripts in place, so the scripts keep their ids and names and references to them keep working. It only ever adds, and never deletes anything, with one exception: the objects on the add-on's own layout `SaXMLDeliveryExecutionContext` are replaced with the latest ones, so don't customize that layout.
 
@@ -15,13 +15,13 @@ For each file it creates missing fields and puts them on the layout, creates mis
 Give every file of the solution, so it can see which files' table occurrences use which tables. Without `--apply` it does a dry run and changes nothing:
 
 ```bash
-./update-saxml-addon.sh --username=<full access account> --host=<host> --export-account=<export account> FileOne,FileTwo,FileThree
+./deploy-saxml-addon.sh --username=<full access account> --host=<host> --export-account=<export account> FileOne,FileTwo,FileThree
 ```
 
 Then apply. `--grant-privileges` applies the privilege grants; leave it out to update only the schema and scripts:
 
 ```bash
-./update-saxml-addon.sh --username=<full access account> --host=<host> --export-account=<export account> FileOne,FileTwo,FileThree --apply --grant-privileges
+./deploy-saxml-addon.sh --username=<full access account> --host=<host> --export-account=<export account> FileOne,FileTwo,FileThree --apply --grant-privileges
 ```
 
 If every file uses the same [Full Access] account and password, add `--credentials-from=fmnet://<host>/<one of the files>`. Every file then uses the password stored in the keychain for that one file, so you store it once instead of once per file.
