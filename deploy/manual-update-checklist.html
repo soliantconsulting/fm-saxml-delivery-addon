@@ -64,9 +64,9 @@
 </div>
 <div class="wrap" id="list">
   <div class="context">
-    <h2>Add-on: SaXMLDelivery<span>•</span>Update to 0.2.6<span>•</span>Manual (FileMaker Pro)</h2>
+    <h2>Add-on: SaXMLDelivery<span>•</span>Update to 0.2.7<span>•</span>Manual (FileMaker Pro)</h2>
   </div>
-  <p class="note">For a file on any 0.1.x or 0.2.x version that can't be updated with <code>deploy/deploy-saxml-addon.sh</code>. Back up the target file first. Open <code>src/SaXMLDelivery.fmp12</code> from this repo next to it, and work through the groups in order: the scripts and layout refer to the new fields. A file on 0.2.2 to 0.2.5 needs only the layout, the scripts and the privilege set groups: 0.2.3 to 0.2.6 change the version strings and the privilege guidance.</p>
+  <p class="note">For a file on any 0.1.x or 0.2.x version that can't be updated with <code>deploy/deploy-saxml-addon.sh</code>. Back up the target file first. Open <code>src/SaXMLDelivery.fmp12</code> from this repo next to it, and work through the groups in order: the scripts and layout refer to the new fields. A file on 0.2.2 to 0.2.6 needs only the layout, the scripts and the privilege set groups: 0.2.3 to 0.2.7 change the version strings and the privilege guidance.</p>
   <div class="cols"><span>Order</span><span>Type</span><span>Task Summary</span><span class="r">Est. time</span><span class="c">Done</span></div>
 </div>
 
@@ -82,7 +82,7 @@ const GROUPS = [
   ]},
   { name: "Layout Content", tasks: [
     ["Change", "Set the body part height of <code>SaXMLDeliveryExecutionContext</code> to 781", "Before pasting, so the objects are not squeezed into a shorter body.", 2],
-    ["Change", "Replace all objects on <code>SaXMLDeliveryExecutionContext</code>", "Delete every object, then copy all objects from the same layout in the source file and paste them in place. Picks up the new fields and the v0.2.6 label.", 8],
+    ["Change", "Replace all objects on <code>SaXMLDeliveryExecutionContext</code>", "Delete every object, then copy all objects from the same layout in the source file and paste them in place. Picks up the new fields and the v0.2.7 label.", 8],
   ]},
   { name: "Script", tasks: [
     ["Change", "Replace the steps of <code>saxmlDelivery_createXml</code>", "Select all steps and delete them, then paste all steps from the source script. Don't delete the script: replacing steps keeps its ID, so callers keep working.", 5],
@@ -97,12 +97,12 @@ const GROUPS = [
   ]},
   { name: "Post-Deployment", tasks: [
     ["Check", "No <code>&lt;Field Missing&gt;</code> or <code>&lt;unknown&gt;</code> in the pasted scripts", "Search both replaced scripts and the new one.", 3],
-    ["Check", "Run <code>saxmlDelivery_getVersion</code>", "It returns <code>0.2.6</code>.", 2],
+    ["Check", "Run <code>saxmlDelivery_getVersion</code>", "It returns <code>0.2.7</code>.", 2],
     ["Check", "Call <code>saxmlDelivery_createXml</code> on the hosted file", "It comes back with jobStatus = running, and the record turns done.", 10],
   ]},
 ];
 
-const KEY = "saxml-manual-update-0.2.6";
+const KEY = "saxml-manual-update-0.2.7";
 let state = {};
 try { state = JSON.parse(localStorage.getItem(KEY) || "{}") || {}; } catch (e) { state = {}; }
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(state)); } catch (e) {} };
