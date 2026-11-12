@@ -1,6 +1,6 @@
 # fm-saxml-delivery-addon
 
-Version 0.2.6
+Version 0.2.7
 
 This add-on is a part of the SaXML delivery toolchain. It helps to automate the seamless generation of SaXML files for your FileMaker databases.
 
