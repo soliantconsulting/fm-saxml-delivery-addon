@@ -97,7 +97,7 @@ const GROUPS = [
   ]},
   { name: "Post-Deployment", tasks: [
     ["Check", "No <code>&lt;Field Missing&gt;</code> or <code>&lt;unknown&gt;</code> in the pasted scripts", "Search both replaced scripts and the new one.", 3],
-    ["Check", "Run <code>saxmlDelivery_getVersion</code>", "It returns <code>\X</code>.", 2],
+    ["Check", "Run <code>saxmlDelivery_getVersion</code>", "It returns <code>0.2.6</code>.", 2],
     ["Check", "Call <code>saxmlDelivery_createXml</code> on the hosted file", "It comes back with jobStatus = running, and the record turns done.", 10],
   ]},
 ];
