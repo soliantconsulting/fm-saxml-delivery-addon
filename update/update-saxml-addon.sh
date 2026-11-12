@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Brings an installed copy of the SaXML delivery add-on up to date, whatever version it is on.
 # The latest definitions are read from src/SaXMLDelivery.fmp12 in this repo. See README.md.
-#   update-saxml-addon.sh --username=<account> [--host=<host>] [--export-account=<name> [--grant-privileges]] [--install] [--apply] <file>,<file>,...
+#   update-saxml-addon.sh --username=<account> [--host=<host>] [--credentials-from=<address>] [--export-account=<name>
+#     [--grant-privileges [--grant-field-access]]] [--install] [--jobs=<n>] [--apply] <file>,<file>,...
 # A <file> is a name on --host, or a full path or fmnet:// address. Separate files with commas.
 # Without --apply it only does a dry run and changes nothing.
 # --export-account names the account the pipeline calls the add-on with. The script then also plans that account's
@@ -54,7 +55,7 @@ for a in "$@"; do
        done ;;
   esac
 done
-[ -n "$USERNAME" ] && [ ${#TARGETS[@]} -gt 0 ] || { sed -n '2,5p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
+[ -n "$USERNAME" ] && [ ${#TARGETS[@]} -gt 0 ] || { sed -n '2,6p' "$0" | sed 's/^# \{0,1\}//' >&2; exit 64; }
 [ $GRANT -eq 0 ] || [ -n "$EXPORT" ] || { echo "--grant-privileges needs --export-account=<name>" >&2; exit 64; }
 [ $FIELDS -eq 0 ] || [ $GRANT -eq 1 ] || { echo "--grant-field-access needs --grant-privileges" >&2; exit 64; }
 for t in "${TARGETS[@]}"; do
@@ -451,16 +452,16 @@ def plan(src, tgt, say=print, install=False):
     """The creates and the script updates that bring tgt up to the source, printing a line per element.
     With install, a file without the add-on gets it; without, it exits 2."""
     creates, updates = [], []
-    if not installed(tgt):
-        if not install:
+    if not installed(tgt) or (install and tgt["layout"] is None):
+        if not installed(tgt) and not install:
             say("NOT-INSTALLED")
             sys.exit(2)
-        say("  not installed; installing %s" % version(src))
+        say("  %s; installing %s" % ("not installed" if not installed(tgt) else "partly installed (no layout)", version(src)))
         creates = install_ops(src, tgt, say)
         # from here on the file is planned as if it had the table, the table occurrence and an empty layout
         tgt = dict(tgt, layout=tgt["layout"] or {"contents": {"objects": []}, "parts": src["layout"]["parts"]})
     elif tgt["layout"] is None:
-        raise SystemExit("the layout %s is missing; reinstall the add-on" % LAYOUT)
+        raise SystemExit("the layout %s is missing; run again with --install to add it" % LAYOUT)
     else:
         say("  installed version %s, latest %s" % (version(tgt), version(src)))
     have = {d["path"] for d in tgt["baseDirs"]}
@@ -530,6 +531,10 @@ elif cmd == "multi":
     rest = sys.argv[11:]
     i1 = rest.index("--"); i2 = rest.index("--", i1 + 1)
     targets = [t.split("|", 1) for t in rest[i1 + 1:i2]]
+    dup = sorted({l for l, _ in targets if [x.lower() for x, _ in targets].count(l.lower()) > 1})
+    if dup:
+        print("each file in one run needs its own name; given more than once: %s" % ", ".join(dup), file=sys.stderr)
+        sys.exit(64)
     fm_args = rest[i2 + 1:]
     src = reads(src_path)
     read_ops = [l.rstrip("\n") for l in open(read_path) if l.strip()]
@@ -782,20 +787,35 @@ elif cmd == "multi":
                     return "verify failed", installed_
         return "changed", installed_
 
+    def work_safe(s):
+        """work, but an unexpected error fails the file and rolls its session back: closing the session's input
+        would otherwise commit whatever it had sent."""
+        try:
+            return work(s)
+        except BaseException as e:  # reads() raises SystemExit on an unexpected read error
+            s.say("  failed: %s" % (e.code if isinstance(e, SystemExit) else "%s: %s" % (type(e).__name__, e)))
+            s.ok = False
+            try:  # an error result rolls the whole session back under --abort-on-error
+                s.p.stdin.write('{"op":"read:script","name":"saxmlDelivery_rollback_on_purpose"}\n'); s.p.stdin.flush()
+            except (BrokenPipeError, ValueError):
+                pass
+            return "failed", installed(reads_of[s.label])
+
     if hold:
         with ThreadPoolExecutor(max_workers=jobs) as ex:
-            results = list(ex.map(work, live))
+            results = list(ex.map(work_safe, live))
         # commit (or end the dry run) for every file, then print each file's lines in the order given
         with ThreadPoolExecutor(max_workers=len(live)) as ex:
             closed = list(ex.map(lambda s: s.close() or (bool(s.bad) and not getattr(s, "opened", False)), live))
     else:
         results, closed = [], []
         for s in live:
-            results.append(work(s))
+            results.append(work_safe(s))
             closed.append(s.close() if getattr(s, "opened", False) else True)
     # a file with nothing to send has nothing to commit
     closed = [c or st in ("up to date", "not installed") for c, (st, _) in zip(closed, results)]
     for s, (status, inst), committed in zip(live, results, closed):
+        s.committed = committed
         print("\n".join(s.out))
         if status == "changed" and not committed:
             status = "failed"
@@ -840,17 +860,17 @@ elif cmd == "multi":
         print("\nNothing to apply.")
         print("\n".join("  " + r for r in report))
         skipped_note()
-        sys.exit(0)
+        sys.exit(1 if len(live) < len(sessions) else 0)
     if not apply_:
         print("\n== Summary (dry run)"); print("\n".join("  " + r for r in report))
         multifile_note()
         print("\nDry run only: nothing was changed. Back the files up, close Manage Database and the script editor in each, then run again with --apply%s to update %d file(s)."
               % (" (and --grant-privileges for the privilege grants)" if export else "", len(changed)))
-        sys.exit(0)
+        sys.exit(1 if len(live) < len(sessions) else 0)
     print("\n== Summary"); print("\n".join("  " + r for r in report))
     if export and grant:
         print("\n== Privileges after the update")
-        after = {s.label: (getattr(s, "post", None) or reads_of[s.label]) for s in live}
+        after = {s.label: (s.post if getattr(s, "post", None) and s.committed else reads_of[s.label]) for s in live}
         plans, warns = privilege_plan(after, export, field_access, install)
         if all(op is None for op, _ in plans.values()):
             print("  verified: the export account has everything it needs in every file")
@@ -867,7 +887,7 @@ elif cmd == "multi":
         print("If the Data API account uses one of them, rerun with every file of the solution, --export-account=<that account> and --grant-privileges.")
     skipped_note()
     multifile_note()
-    sys.exit(1 if any(st in ("failed", "verify failed") for st, _ in results) or not all(closed) else 0)
+    sys.exit(1 if any(st in ("failed", "verify failed") for st, _ in results) or not all(closed) or len(live) < len(sessions) else 0)
 elif cmd == "timing":
     # timing.tsv rows: kind, file, ops, seconds. One row per filemaker call; each call opens and closes the file.
     rows = [l.rstrip("\n").split("\t") for l in open(sys.argv[2]) if l.strip()]

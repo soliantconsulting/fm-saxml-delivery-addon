@@ -2,7 +2,7 @@
 
 Brings installed copies of the add-on up to date from whatever version they are on, and, if you ask it to, gives the pipeline's account the privileges it needs. The latest definitions come from `src/SaXMLDelivery.fmp12` in this repo, so check out the tag of the release you want first.
 
-For each file it creates missing fields and puts them on the layout, creates missing scripts, and replaces the body of existing scripts in place, so the scripts keep their ids and names and references to them keep working. It only ever adds, and never deletes anything.
+For each file it creates missing fields and puts them on the layout, creates missing scripts, and replaces the body of existing scripts in place, so the scripts keep their ids and names and references to them keep working. It only ever adds, and never deletes anything, with one exception: the objects on the add-on's own layout `SaXMLDeliveryExecutionContext` are replaced with the latest ones, so don't customize that layout.
 
 ## What you need
 
@@ -28,7 +28,7 @@ If every file uses the same [Full Access] account and password, add `--credentia
 
 A file without the add-on is skipped. Add `--install` to install it there instead, with no need for FileMaker Pro's Install Add-on: the script creates the `SaXMLDelivery` table and its table occurrence, the `SaXMLDelivery` script and layout folders, the `SaXMLDeliveryExecutionContext` layout and the base directory for `xmlFile`, and then the fields, layout objects and scripts as for an update. With `--export-account` the planned grants then include the add-on's own. It stops with a reason, and changes nothing in that file, when a table occurrence named `SaXMLDelivery` already uses another table, or the table is there without that table occurrence.
 
-Hosted files are opened and worked on three at a time. `--jobs=<n>` changes that; lower it if a busy host answers some opens with error 802.
+Hosted files are opened three at a time. `--jobs=<n>` changes that; lower it if a busy host answers some opens with error 802. Each file then stays open until the end of the run, so a run with many files holds that many connections to the host. A file that can't be opened is skipped, and the run exits nonzero.
 
 ## What the privilege grants are
 
