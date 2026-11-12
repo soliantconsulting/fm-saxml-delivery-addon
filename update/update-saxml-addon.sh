@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Brings an installed copy of the SaXML delivery add-on up to date, whatever version it is on.
 # The latest definitions are read from src/SaXMLDelivery.fmp12 in this repo. See README.md.
-#   update-saxml-addon.sh --username=<account> [--host=<host>] [--export-account=<name> [--grant-privileges]] [--apply] <file>,<file>,...
+#   update-saxml-addon.sh --username=<account> [--host=<host>] [--export-account=<name> [--grant-privileges]] [--install] [--apply] <file>,<file>,...
 # A <file> is a name on --host, or a full path or fmnet:// address. Separate files with commas.
 # Without --apply it only does a dry run and changes nothing.
 # --export-account names the account the pipeline calls the add-on with. The script then also plans that account's
@@ -11,6 +11,8 @@
 # --grant-field-access, with --grant-privileges, also gives the export account field access all on cross-file tables
 # where its View is yes or limited (without it those only get a NOTE), so other files' calculations keep field names.
 # --jobs=<n> opens and works on at most n hosted files at once (default 3).
+# --install also installs the add-on in each file that lacks it: the SaXMLDelivery table and its table occurrence,
+# the script and layout folders and the layout, then the fields, layout objects and scripts as for an update.
 #
 # It compares each installed file with the source and, for what differs:
 #   - creates missing fields
@@ -32,7 +34,7 @@ HERE=$(cd "$(dirname "$0")" && pwd)
 SOURCE=${SOURCE:-$HERE/../src/SaXMLDelivery.fmp12}
 SOURCE_USER=${SOURCE_USER:-Admin}
 
-USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 FIELDS=0 JOBS=3 CREDS=() TARGETS=()
+USERNAME="" HOST="" APPLY=0 EXPORT="" GRANT=0 FIELDS=0 INSTALL=0 JOBS=3 CREDS=() TARGETS=()
 for a in "$@"; do
   case $a in
     --username=*) USERNAME=${a#*=} ;;
@@ -41,6 +43,7 @@ for a in "$@"; do
     --export-account=*) EXPORT=${a#*=} ;;
     --grant-privileges) GRANT=1 ;;
     --grant-field-access) FIELDS=1 ;;
+    --install) INSTALL=1 ;;
     --credentials-from=*) CREDS=("$a") ;;
     --jobs=*) JOBS=${a#*=}; [[ $JOBS =~ ^[1-9][0-9]*$ ]] || { echo "--jobs needs a positive number" >&2; exit 64; } ;;
     --*) echo "unknown option: $a" >&2; exit 64 ;;
@@ -93,7 +96,7 @@ def reads(path):
         e = fatal[0]["error"]
         raise SystemExit("ERROR %s (dbError %s): %s" % (e.get("code"), e.get("dbError"), e.get("message", "")[:200]))
     ops = [o for o in lines(path) if "op" in o]
-    if len(ops) != len(SCRIPTS) + 6:
+    if len(ops) != len(SCRIPTS) + 10:
         raise SystemExit("ERROR no read result (did the file open?)")
     ops, extra = ops[:len(SCRIPTS) + 3], ops[len(SCRIPTS) + 3:]
     res = {"scripts": {}}
@@ -108,7 +111,8 @@ def reads(path):
     res["fields"] = {i["name"]: i for i in f["result"]["items"]} if f["status"] == "ok" else {}
     res["layout"] = l["result"] if l["status"] == "ok" else None
     res["privsets"] = p["result"]["items"] if p["status"] == "ok" else []
-    res["tos"], res["sources"], res["accounts"] = [o["result"]["items"] if o["status"] == "ok" else [] for o in extra]
+    res["tos"], res["sources"], res["accounts"], res["scriptTree"], res["layoutTree"], res["tables"], res["baseDirs"] = \
+        [o["result"]["items"] if o["status"] == "ok" else [] for o in extra]
     return res
 
 def norm(body):
@@ -186,9 +190,10 @@ def layout_ops(src, tgt):
     if layout_flat(src["layout"])["bodyHeight"] != layout_flat(tgt["layout"])["bodyHeight"]:
         # before the objects, so they are not squeezed into the old, shorter body
         ops.append({"op": "update:layout", "name": LAYOUT, "updateParts": [{"type": "body", "height": src["layout"]["parts"][0]["height"]}]})
-    ops.append({"op": "update:layout", "name": LAYOUT,
-                "removeObjects": [{"id": o["id"]} for o in tgt["layout"]["contents"]["objects"]],
-                "addObjects": [conv(o) for o in src["layout"]["contents"]["objects"]]})
+    op = {"op": "update:layout", "name": LAYOUT, "addObjects": [conv(o) for o in src["layout"]["contents"]["objects"]]}
+    if tgt["layout"]["contents"]["objects"]:  # an empty removeObjects is refused
+        op["removeObjects"] = [{"id": o["id"]} for o in tgt["layout"]["contents"]["objects"]]
+    ops.append(op)
     return ops
 
 def script_access(s, name):
@@ -332,9 +337,10 @@ def fields_visible(g):
         return False
     return f.get("newFields", {}).get("access", "noAccess") != "noAccess" and all(x.get("access") != "noAccess" for x in f.get("fields", []))
 
-def privilege_plan(files, account, field_access=False):
+def privilege_plan(files, account, field_access=False, install=False):
     """{label: (update:privilegeSet op or None, [plan lines])} for the export account in every file.
-    field_access: also grant field access all where View is yes or limited, instead of only noting it."""
+    field_access: also grant field access all where View is yes or limited, instead of only noting it.
+    install: a file without the add-on gets it in this run, so it needs the add-on's grants too."""
     needs, warns = cross_file_needs(files)
     out = {}
     for label, r in files.items():
@@ -343,8 +349,7 @@ def privilege_plan(files, account, field_access=False):
         if problem:
             out[label] = (None, ["  PROBLEM " + problem])
             continue
-        installed = any(v is not None for v in r["scripts"].values())
-        tables, scripts, layouts, notes = addon_grants(r, s) if installed else ([], [], [], [])
+        tables, scripts, layouts, notes = addon_grants(r, s) if install or installed(r) else ([], [], [], [])
         named = {t["name"] for t in tables}
         for table, refs in sorted(needs.get(label, {}).items()):
             g = table_grant(s, table)
@@ -397,18 +402,77 @@ def privilege_plan(files, account, field_access=False):
         out[label] = (op, say + ["  NOTE " + n for n in notes])
     return out, warns
 
-def plan(src, tgt, say=print):
-    """The creates and the script updates that bring tgt up to the source, printing a line per element."""
-    if all(v is None for v in tgt["scripts"].values()) and not tgt["fields"]:
-        say("NOT-INSTALLED")
-        sys.exit(2)
+def installed(r):
+    return any(v is not None for v in r["scripts"].values()) or bool(r["fields"])
+
+def has_folder(tree, path):
+    """Whether a script or layout tree from a listing read has the "/"-separated folder path."""
+    for name in [p for p in path.split("/") if p]:
+        tree = next((i.get("items", []) for i in tree if i.get("type") == "folder" and i["name"] == name), None)
+        if tree is None:
+            return False
+    return True
+
+def install_ops(src, tgt, say):
+    """The creates that give a file without the add-on its table, table occurrence, folders and empty layout.
+    Raises SystemExit with the reason when something of that name is already there and would get in the way."""
+    ops = []
+    to = next((o for o in tgt["tos"] if o["name"] == TABLE), None)
+    if not any(t["name"] == TABLE for t in tgt["tables"]):
+        if to is not None:
+            raise SystemExit("a table occurrence named %s already uses another table; rename it first" % TABLE)
+        ops.append({"op": "create:table", "name": TABLE, "occurrence": {"name": TABLE}})
+        say("  table %-27s CREATE (with its table occurrence)" % TABLE)
+    elif to is None or to.get("table", {}).get("name") != TABLE or to["table"].get("dataSource"):
+        raise SystemExit("the table %s is there but no table occurrence %s uses it; add one first" % (TABLE, TABLE))
+    sfolder = next(s for s in src["scripts"].values()).get("folder")
+    if sfolder and not has_folder(tgt["scriptTree"], sfolder):
+        ops.append({"op": "create:script", "type": "folder", "name": sfolder, "hidden": True})
+        say("  script folder %-19s CREATE" % sfolder)
     if tgt["layout"] is None:
-        print("ERROR the layout %s is missing; reinstall the add-on" % LAYOUT, file=sys.stderr)
-        sys.exit(3)
+        l = src["layout"]
+        lfolder = l.get("folder")
+        if lfolder and not has_folder(tgt["layoutTree"], lfolder):
+            ops.append({"op": "create:layout", "type": "folder", "name": lfolder, "hidden": True})
+            say("  layout folder %-19s CREATE" % lfolder)
+        op = {"op": "create:layout", "name": LAYOUT, "tableOccurrence": TABLE,
+              "parts": [{"type": "body", "height": l["parts"][0]["height"]}], "objects": []}
+        for k in ("hidden", "quickFind", "saveRecordChangesAutomatically", "showFieldFramesWhenActive",
+                  "delineateCurrentRecordOnly", "showCurrentRecordIndicator", "showFieldAlerts", "viewStyles"):
+            if k in l:
+                op[k] = l[k]
+        if lfolder:
+            op["folder"] = lfolder
+        ops.append(op)
+        say("  layout %-26s CREATE" % LAYOUT)
+    return ops
+
+def plan(src, tgt, say=print, install=False):
+    """The creates and the script updates that bring tgt up to the source, printing a line per element.
+    With install, a file without the add-on gets it; without, it exits 2."""
     creates, updates = [], []
-    say("  installed version %s, latest %s" % (version(tgt), version(src)))
+    if not installed(tgt):
+        if not install:
+            say("NOT-INSTALLED")
+            sys.exit(2)
+        say("  not installed; installing %s" % version(src))
+        creates = install_ops(src, tgt, say)
+        # from here on the file is planned as if it had the table, the table occurrence and an empty layout
+        tgt = dict(tgt, layout=tgt["layout"] or {"contents": {"objects": []}, "parts": src["layout"]["parts"]})
+    elif tgt["layout"] is None:
+        raise SystemExit("the layout %s is missing; reinstall the add-on" % LAYOUT)
+    else:
+        say("  installed version %s, latest %s" % (version(tgt), version(src)))
+    have = {d["path"] for d in tgt["baseDirs"]}
     for n in missing_fields(src, tgt):
         f = src["fields"][n]
+        bd = f.get("options", {}).get("container", {}).get("baseDirectory")
+        if bd and bd not in have:
+            # an externally stored container needs its base directory; the source's is relative to the file
+            d = next(d for d in src["baseDirs"] if d["path"] == bd)
+            creates.append({"op": "create:baseDirectory", "path": bd, "relative": d["relative"]})
+            have.add(bd)
+            say("  base directory %-18s CREATE" % bd)
         op = {"op": "create:field", "table": TABLE, "name": n, "type": f["type"]}
         for k in ("fieldType", "comment", "calculation", "options"):
             if k in f:
@@ -462,8 +526,8 @@ elif cmd == "multi":
     import subprocess, threading, time
     from concurrent.futures import ThreadPoolExecutor
     src_path, read_path, tmp, apply_, grant, export, jobs = sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5] == "1", sys.argv[6] == "1", sys.argv[7], int(sys.argv[8])
-    field_access = sys.argv[9] == "1"
-    rest = sys.argv[10:]
+    field_access, install = sys.argv[9] == "1", sys.argv[10] == "1"
+    rest = sys.argv[11:]
     i1 = rest.index("--"); i2 = rest.index("--", i1 + 1)
     targets = [t.split("|", 1) for t in rest[i1 + 1:i2]]
     fm_args = rest[i2 + 1:]
@@ -634,7 +698,7 @@ elif cmd == "multi":
     grants = {s.label: None for s in live}
     if export:
         print("\n== Privileges of the export account %s" % export)
-        plans, warns = privilege_plan({s.label: reads_of[s.label] for s in live}, export, field_access)
+        plans, warns = privilege_plan({s.label: reads_of[s.label] for s in live}, export, field_access, install)
         for s in live:
             op, say = plans[s.label]
             print(s.label); print("\n".join(say))
@@ -648,7 +712,8 @@ elif cmd == "multi":
         the add-on's table in a file without the add-on), because under --abort-on-error any error result rolls the
         whole session back, and puts the first answers in their place. A script just created is read again."""
         names = {c["name"] for c in created if c.get("op") == "create:script"}
-        send = [i for i in range(len(read_ops)) if i not in s.bad or (i < len(SCRIPTS) and SCRIPTS[i] in names)]
+        fresh = any(c.get("op") in ("create:table", "create:layout") for c in created)  # an install: every read now answers
+        send = [i for i in range(len(read_ops)) if i not in s.bad or fresh or (i < len(SCRIPTS) and SCRIPTS[i] in names)]
         got = s.send([read_ops[i] for i in send], reads_only=True)
         if not s.ok or len(got) != len(send):
             s.ok = False
@@ -663,19 +728,22 @@ elif cmd == "multi":
         """Plans and sends this file's ops, then reads it again in the session. Returns its status word."""
         tgt = reads_of[s.label]
         s.say("%s  (%s)" % (s.label, s.address))
-        installed = True
+        had = installed(tgt)
         try:
-            creates, updates = plan(src, tgt, say=lambda l: l == "NOT-INSTALLED" or s.say(l))
+            creates, updates = plan(src, tgt, say=lambda l: l == "NOT-INSTALLED" or s.say(l), install=install)
         except SystemExit as e:
             if e.code == 2:
-                installed, creates, updates = False, [], []
-                s.say("  the add-on is not installed in this file")
+                creates, updates = [], []
+                s.say("  the add-on is not installed in this file; --install installs it")
             else:
-                s.say("  failed: the layout %s is missing; reinstall the add-on" % LAYOUT)
-                return "failed", installed
-        s.installed = installed
+                s.say("  failed: %s" % e.code)
+                s.planfail = True
+                return "failed", had
+        # installed_: the file has the add-on once this run's writes are in
+        installed_ = had or install
+        s.installing = install and not had
         if creates or updates:
-            if installed and below(version(tgt), "0.2.3"):
+            if installed_ and below(version(tgt), "0.2.3"):
                 pre023.append(s.label)
         g = grants[s.label]
         if g:
@@ -683,7 +751,7 @@ elif cmd == "multi":
             if apply_ and not grant:
                 pskip.append(s.label); g = None
         if not creates and not updates and not g:
-            return ("up to date" if installed else "not installed"), installed
+            return ("up to date" if installed_ else "not installed"), installed_
         if not hold or s.bad:
             if hold:
                 s.close("read")  # its error results would roll the writes back; start clean
@@ -700,19 +768,19 @@ elif cmd == "multi":
         if s.ok and g:
             s.send([g])
         if not s.ok:
-            return "failed", installed
+            return "failed", installed_
         if apply_:
             s.post = reread(s, creates)
             if not s.ok:
-                return "failed", installed
-            if installed:
+                return "failed", installed_
+            if installed_:
                 bad = [n for n in SCRIPTS if s.post["scripts"][n] is None or differing(src["scripts"][n]["body"], s.post["scripts"][n]["body"])]
                 bad += ["field " + n for n in missing_fields(src, s.post)]
                 bad += ["layout"] if layout_flat(src["layout"]) != layout_flat(s.post["layout"]) else []
                 if bad:
                     s.verify_failed = ", ".join(bad)
-                    return "verify failed", installed
-        return "changed", installed
+                    return "verify failed", installed_
+        return "changed", installed_
 
     if hold:
         with ThreadPoolExecutor(max_workers=jobs) as ex:
@@ -727,11 +795,13 @@ elif cmd == "multi":
             closed.append(s.close() if getattr(s, "opened", False) else True)
     # a file with nothing to send has nothing to commit
     closed = [c or st in ("up to date", "not installed") for c, (st, _) in zip(closed, results)]
-    for s, (status, installed), committed in zip(live, results, closed):
+    for s, (status, inst), committed in zip(live, results, closed):
         print("\n".join(s.out))
         if status == "changed" and not committed:
             status = "failed"
-        if status == "failed":
+        if status == "failed" and getattr(s, "planfail", False):
+            report.append("%s: failed (nothing was sent)" % s.label)
+        elif status == "failed":
             print("  failed:")
             for e in s.errors():
                 print(e)
@@ -746,8 +816,9 @@ elif cmd == "multi":
             report.append("%s: add-on not installed, nothing to grant" % s.label)
         elif not apply_:
             report.append("%s: would be updated" % s.label)
-        elif installed:
-            print("  updated and verified"); report.append("%s: updated and verified" % s.label)
+        elif inst:
+            word = "installed" if getattr(s, "installing", False) else "updated"
+            print("  %s and verified" % word); report.append("%s: %s and verified" % (s.label, word))
             n = privilege_sets_needing_grant(s.post)
             if n and not export:
                 needs_sets.append("%s (%s)" % (s.label, ", ".join(n)))
@@ -780,7 +851,7 @@ elif cmd == "multi":
     if export and grant:
         print("\n== Privileges after the update")
         after = {s.label: (getattr(s, "post", None) or reads_of[s.label]) for s in live}
-        plans, warns = privilege_plan(after, export, field_access)
+        plans, warns = privilege_plan(after, export, field_access, install)
         if all(op is None for op, _ in plans.values()):
             print("  verified: the export account has everything it needs in every file")
         else:
@@ -854,6 +925,10 @@ cat > "$TMP/read.ndjson" <<'E'
 {"op":"read:tableOccurrence"}
 {"op":"read:externalDataSource","detail":true}
 {"op":"read:account","detail":true}
+{"op":"read:script"}
+{"op":"read:layout"}
+{"op":"read:table"}
+{"op":"read:baseDirectory","detail":true}
 E
 
 echo "Reading the latest definitions from $(basename "$SOURCE")"
@@ -866,5 +941,5 @@ echo "Latest version: $(H version "$TMP/source.txt")"
 # Every file at once, one filemaker session each; see the multi command in the helper.
 ARGS=()
 for t in "${TARGETS[@]}"; do f=$(hosted "$t"); n=${f##*/}; ARGS+=("${n%.fmp12}|$f"); done
-H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" "$JOBS" "$FIELDS" -- "${ARGS[@]}" -- \
+H multi "$TMP/source.txt" "$TMP/read.ndjson" "$TMP" "$APPLY" "$GRANT" "$EXPORT" "$JOBS" "$FIELDS" "$INSTALL" -- "${ARGS[@]}" -- \
   "--username=$USERNAME" --keychain ${CREDS[@]+"${CREDS[@]}"} --prompt
